@@ -28,6 +28,8 @@ class Router:  # pylint: disable=too-many-instance-attributes
         router_mode: Literal["disagg", "round-robin"] = "disagg",
         pd_balance_factor: float = 0.0,
     ):  # pylint: disable=too-many-arguments,too-many-locals
+        print("trying adaptive pd adjusting")
+
         """
         Spawn len(host_list) server endpoints with Popen.
         """
@@ -65,6 +67,12 @@ class Router:  # pylint: disable=too-many-instance-attributes
         for num_gpus_val in num_gpus:
             self.device_id_starts.append(self.device_id_starts[-1] + num_gpus_val)
         # device_id_starts[-1] is the total number of GPUs.
+
+        # running average of number of request and response tokens
+        self.avg_request_tokens = None
+        self.avg_response_tokens = None
+        self.num_requests = 0
+        self.pd_delta = 0.05
 
         def start_server(i: int):
             nvshmem_config = {
@@ -118,17 +126,42 @@ class Router:  # pylint: disable=too-many-instance-attributes
         """
         if isinstance(request.prompt, str):
             request.prompt = self.tokenizer.encode(request.prompt)
+
+        num_request_tokens = len(request.prompt)
+
+        self.num_requests += 1
+        if self.avg_request_tokens == None:
+            self.avg_request_tokens = num_request_tokens
+        else:
+            if num_request_tokens > self.avg_request_tokens:
+                self.pd_balance_factor += self.pd_delta if (self.pd_balance_factor + self.pd_delta) <= 0.5 else 0
+            elif num_request_tokens < self.avg_request_tokens:
+                self.pd_balance_factor -= self.pd_delta if (self.pd_balance_factor - self.pd_delta) >= 0 else 0
+        
+        self.avg_request_tokens = ((self.avg_request_tokens * (self.num_requests - 1)) + num_request_tokens) / self.num_requests
+
         # Add a debugConfig if not present
         if request.debug_config is None:
             request.debug_config = openai_api_protocol.DebugConfig()
         completed = False
+        num_response_tokens = 0
         while not completed:
             completed = True
             async for response in self.translate_request(request, request_id):
                 if response is None:
                     completed = False
                     break
+                num_response_tokens += 1
+
+                if (self.avg_response_tokens != None) and (num_response_tokens > self.avg_response_tokens):
+                    self.pd_balance_factor -= self.pd_delta if (self.pd_balance_factor - self.pd_delta) >= 0 else 0
+
                 yield response
+        
+        if self.avg_response_tokens == None:
+            self.avg_response_tokens = num_response_tokens
+        else:
+            self.avg_response_tokens = ((self.avg_response_tokens * (self.num_requests - 1)) + num_response_tokens) / self.num_requests
 
     async def translate_request(
         self, request: openai_api_protocol.CompletionRequest, request_id: str
@@ -240,6 +273,7 @@ class Router:  # pylint: disable=too-many-instance-attributes
         # Tell D to prepare metadata for prompt[0:kv_window_end].
         # P does not need to sample. Ask D to treat the last
         # token like the first sampled token.
+        # print(f"pd_balance_factor = {pd_balance_factor:.3f}")
         kv_window_end = (
             -1
             if math.fabs(pd_balance_factor) < 1e-5
