@@ -135,6 +135,22 @@ class AttachRequestRateTimestamp(RequestProcessor):  # pylint: disable=too-few-p
             timestamp += float(np.random.exponential(1.0 / self.request_rate))
         return request_records
 
+class AttachFluctuatingRateTimestamp(RequestProcessor):
+    """The processor that applies timestamps for fluctuating request rates"""
+    def __init__(self, peak_request_rate: np.float32, duration: np.float32) -> None:
+        self.peak_request_rate = peak_request_rate
+        self.duration = duration
+    
+    def __call__(self, request_records: List[RequestRecord]) -> List[RequestRecord]:
+        time_of_peak = 60.0 * (self.duration / 2.0)
+        timestamps = np.clip(np.random.normal(time_of_peak, 
+                                              time_of_peak / 3.0, # set standard deviation such that 0.0 and duration is 3 stds away form the mean
+                                              len(request_records)), 0.0, float(60.0 * self.duration))
+        timestamps.sort()
+        for i, request_record in enumerate(request_records):
+            assert request_record.timestamp is None, "The request record already has a timestamp"
+            request_record.timestamp = timestamps[i]
+        return request_records
 
 class AttachExecutionFeature(RequestProcessor):  # pylint: disable=too-few-public-methods
     """The processor that attaches execution features to all requests"""
@@ -573,7 +589,6 @@ class FixTimestampExecutor(Executor):  # pylint: disable=too-few-public-methods
             )
         )
 
-
 def create_pipelines(
     args: argparse.Namespace, f_create_api_endpoint: Callable[[], APIEndPoint], dataset: Dataset
 ) -> List[RequestProcessor]:
@@ -657,7 +672,46 @@ def create_pipelines(
             )
             for request_rate in args.request_rate
         ]
+    if args.peak_request_rate is not None:
+        if args.num_warmup_requests is None:
+            raise ValueError(
+                "Please specify the number of warmup requests via "
+                '"--num-warmup-requests" when running fluctuating request rates simulation.'
+            )
+        num_total_requests = args.num_requests
+        
+        if dataset.require_fake_warmup:
+            num_samples = num_total_requests
+        else:
+            num_samples = num_total_requests + args.num_warmup_requests
+        
+        return [
+            SequentialProcessor(
+                LogMessage(f"Running fluctuating request rates for {args.duration} minutes, with a peak request rate of {args.peak_request_rate} minutes"),
+                SampleRequests(num_samples),
+                AttachModelName(args.tokenizer),
+                AttachFluctuatingRateTimestamp(args.peak_request_rate, args.duration),
+                AttachStreamFlag(args.stream),
+                AttachSamplingOptions(args.temperature, args.top_p, args.ignore_eos),
+                AttachExecutionFeature({"peak_request_rate": float(args.peak_request_rate)}),
+                WarmupAndRun(
+                    num_warmup_requests=args.num_warmup_requests,
+                    num_benchmark_requests=num_total_requests,
+                    pipeline=FixTimestampExecutor(
+                        f_create_api_endpoint,
+                        args.num_process_workers,
+                        args.disable_tqdm,
+                        args.max_schedule_gap,
+                        args.num_requests,
+                        0.0 # this is not supposed to be used
+                    ),
+                    cuda_profile_url=cuda_profile_url,
+                    fake_warmup=dataset.require_fake_warmup
+                )
+            )
+        ]
+
     raise ValueError(
         'Unable to create executor. Please specify one of "num_concurrent_requests" '
-        'and "request_rate".'
+        ', "request_rate" and "peak_request_rate".'
     )

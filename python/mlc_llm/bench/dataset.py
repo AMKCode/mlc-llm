@@ -787,6 +787,12 @@ def create_dataset(args: argparse.Namespace, tokenizer: AutoTokenizer) -> "Datas
                 f"Unable to detect the dataset kind from dataset path {args.dataset_path}. "
                 'Please specify the dataset kind via "--dataset".'
             )
+    
+    if args.peak_request_rate:
+        args.num_requests = int(float(args.peak_request_rate) * float(np.sqrt(2.0 * np.pi * np.square((60.0 * args.duration) / (2.0 * 3.0))))) # scales the normal distribution PDF, then estimate the total number of requests
+        # standard deviation is taken to be 1/3 of the mean, which in turn is half of the duration
+
+
     if args.dataset == "sharegpt":
         return ShareGPTDataset(args.dataset_path, tokenizer, args.apply_chat_template)
     if args.dataset == "llmperf":

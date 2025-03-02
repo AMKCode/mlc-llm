@@ -131,7 +131,12 @@ def main(args: argparse.argparse.Namespace):
     mlc_server = None
     if args.mlc_model_lib:
         mlc_server = _launch_mlc_server(args)
-    if args.num_requests <= 0:
+    if args.peak_request_rate:
+        assert(args.duration), "duration needs to be specified"
+        assert(args.num_requests is None), "num-requests cannot be specified if peak-request-rate is specified"
+        assert(args.num_concurrent_requests is None), "num-concurrent-requests cannot be specified if peak-request-rate is specified"
+        assert(args.request_rate is None), "request-rate cannot be specified if peak-request-rate is specified"
+    elif args.num_requests <= 0:
         raise ValueError("Number of requests to benchmark must be positive.")
 
     def _main():
@@ -213,7 +218,6 @@ if __name__ == "__main__":
     parser.add_argument(
         "--num-requests",
         type=int,
-        required=True,
         help="The number of requests for benchmark.",
     )
     parser.add_argument(
@@ -247,6 +251,16 @@ if __name__ == "__main__":
         'by commas(","). '
         "When specified, the benchmark sends these many new requests each second. "
         'If it is "inf", all requests will be sent together at once.',
+    )
+    parser.add_argument(
+        "--peak-request-rate",
+        type=float,
+        help="The peak request rate to run a fluctuating request rate benchmark"
+    )
+    parser.add_argument(
+        "--duration",
+        type=float,
+        help="The duration (in minutes) to run a fluctuating request rate benchmark"
     )
     parser.add_argument(
         "--input-len",
