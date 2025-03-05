@@ -7,12 +7,14 @@ from typing import Any, AsyncGenerator, Iterable, List, Literal, Optional, Tuple
 
 import aiohttp  # pylint: disable=import-error
 import tvm
+import numpy as np
 
 from mlc_llm.protocol import openai_api_protocol
 from mlc_llm.serve import EngineConfig, PopenServer
 from mlc_llm.serve.entrypoints import microserving_entrypoints
 from mlc_llm.tokenizers import Tokenizer
 
+import time
 
 class Router:  # pylint: disable=too-many-instance-attributes
     """Programmable Router Implementation"""
@@ -28,8 +30,7 @@ class Router:  # pylint: disable=too-many-instance-attributes
         router_mode: Literal["disagg", "round-robin"] = "disagg",
         pd_balance_factor: float = 0.0,
     ):  # pylint: disable=too-many-arguments,too-many-locals
-        print("trying adaptive pd adjusting")
-
+        print("trying fixed pd")
         """
         Spawn len(host_list) server endpoints with Popen.
         """
@@ -68,11 +69,19 @@ class Router:  # pylint: disable=too-many-instance-attributes
             self.device_id_starts.append(self.device_id_starts[-1] + num_gpus_val)
         # device_id_starts[-1] is the total number of GPUs.
 
-        # running average of number of request and response tokens
-        self.avg_request_tokens = None
-        self.avg_response_tokens = None
+        # added
+        self.lock = threading.Lock()
+        # self.total_prefill_time = 0.
+        # self.total_decode_time = 0.
+        # self.total_prep_recv_time = 0.
         self.num_requests = 0
-        self.pd_delta = 0.05
+        self.request_num = -1
+        # self.init_time = time.time()
+        # self.stats = np.zeros((540, 1))
+        # self.prefill_time = 0.163440519 # for token length of 3000
+        self.total_prefill_idle_time = 0.0
+        self.ts_of_latest_prefill_idle = None
+        self.is_first_request = True
 
         def start_server(i: int):
             nvshmem_config = {
@@ -127,42 +136,38 @@ class Router:  # pylint: disable=too-many-instance-attributes
         if isinstance(request.prompt, str):
             request.prompt = self.tokenizer.encode(request.prompt)
 
-        num_request_tokens = len(request.prompt)
-
-        self.num_requests += 1
-        if self.avg_request_tokens == None:
-            self.avg_request_tokens = num_request_tokens
-        else:
-            if num_request_tokens > self.avg_request_tokens:
-                self.pd_balance_factor += self.pd_delta if (self.pd_balance_factor + self.pd_delta) <= 0.5 else 0
-            elif num_request_tokens < self.avg_request_tokens:
-                self.pd_balance_factor -= self.pd_delta if (self.pd_balance_factor - self.pd_delta) >= 0 else 0
-        
-        self.avg_request_tokens = ((self.avg_request_tokens * (self.num_requests - 1)) + num_request_tokens) / self.num_requests
-
         # Add a debugConfig if not present
         if request.debug_config is None:
             request.debug_config = openai_api_protocol.DebugConfig()
         completed = False
-        num_response_tokens = 0
         while not completed:
             completed = True
             async for response in self.translate_request(request, request_id):
                 if response is None:
                     completed = False
                     break
-                num_response_tokens += 1
-
-                if (self.avg_response_tokens != None) and (num_response_tokens > self.avg_response_tokens):
-                    self.pd_balance_factor -= self.pd_delta if (self.pd_balance_factor - self.pd_delta) >= 0 else 0
-
                 yield response
         
-        if self.avg_response_tokens == None:
-            self.avg_response_tokens = num_response_tokens
-        else:
-            self.avg_response_tokens = ((self.avg_response_tokens * (self.num_requests - 1)) + num_response_tokens) / self.num_requests
+        with self.lock:
+            self.num_requests += 1
 
+        if self.num_requests == 540:
+            # print(f"num_requests {self.num_requests}")
+            # print(f"Average Prep Recv Time: {self.total_prep_recv_time / self.num_requests}")
+            # print(f"Average Remote Send Time: {self.total_prefill_time / self.num_requests}")
+            # print(f"Average Start Generate Time: {self.total_decode_time / self.num_requests}")
+
+            # self.num_requests = 0
+            # self.total_prefill_time = 0.
+            # self.total_decode_time = 0.
+            # self.total_prep_recv_time = 0.
+
+            # with open("dummy.npy", "wb") as f:
+            #     np.save(f, self.stats)
+            if self.ts_of_latest_prefill_idle is not None:
+                self.total_prefill_idle_time += time.time() - self.ts_of_latest_prefill_idle
+            print(f"total_prefill_idle_time: {self.total_prefill_idle_time}")
+    
     async def translate_request(
         self, request: openai_api_protocol.CompletionRequest, request_id: str
     ) -> AsyncGenerator[openai_api_protocol.CompletionResponse, Any]:
@@ -245,7 +250,7 @@ class Router:  # pylint: disable=too-many-instance-attributes
                             yield None
                     yield response
             self.num_running_requests[cur_endpoint] -= 1
-
+    
     #
     # Below methods are for disaggregated serving
     # Note that only _handle_completion_disagg() has scheduling logics. The other three
@@ -274,6 +279,14 @@ class Router:  # pylint: disable=too-many-instance-attributes
         # P does not need to sample. Ask D to treat the last
         # token like the first sampled token.
         # print(f"pd_balance_factor = {pd_balance_factor:.3f}")
+        
+        # SCRAPPED: using the formula to adjust batch size
+        # def decode_time(batch_size) -> float:
+        #     return (0.0002 * batch_size) + 0.0095 # linear trendline on 
+        
+        # decode_batch_size = len(self.num_running_requests[decode_server_id])
+        # pd_balance_factor = 0.5 - ((decode_time(decode_batch_size) * 100) / (2 * self.prefill_time * decode_batch_size))
+
         kv_window_end = (
             -1
             if math.fabs(pd_balance_factor) < 1e-5
@@ -282,8 +295,15 @@ class Router:  # pylint: disable=too-many-instance-attributes
         async with aiohttp.ClientSession(
             timeout=aiohttp.ClientTimeout(total=3 * 3600), trust_env=True
         ) as session:
-            self.num_running_requests[decode_server_id] += 1
             try:
+                with self.lock:
+                    self.request_num += 1
+                    # req_num = min(self.request_num, 539)
+                    # self.stats[req_num] = self.num_running_requests[decode_server_id]
+                    # self.stats[req_num] = time.time() - self.init_time
+
+                # prep_recv_start = time.time()                
+
                 # 1. Ask D to prepare metadata
                 prep_recv_request = microserving_entrypoints.PrepRecvRequest(
                     **original_request.model_dump(), end=kv_window_end
@@ -307,6 +327,16 @@ class Router:  # pylint: disable=too-many-instance-attributes
                 # 2. Send P the prefill request and D's metadata. When it returns, it means that
                 # KV transfer has finished prefilling and transferring the KV of
                 # prompt[prefix_matched_length:kv_window_end]. So D is ready to decode.
+                
+                # prep_recv_end = time.time()
+
+                if self.num_running_requests[prefill_server_id] == 0:
+                    if self.ts_of_latest_prefill_idle is not None:
+                        self.total_prefill_idle_time += time.time() - self.ts_of_latest_prefill_idle
+                        self.ts_of_latest_prefill_idle = None
+                
+                self.num_running_requests[prefill_server_id] += 1
+
                 if prefix_matched_length < kv_window_end:
                     remote_send_request = microserving_entrypoints.RemoteSendRequest(
                         **original_request.model_dump(),
@@ -320,10 +350,21 @@ class Router:  # pylint: disable=too-many-instance-attributes
                         request=remote_send_request,
                         server_url=self.server_urls[prefill_server_id],
                     )
+                
+                self.num_running_requests[prefill_server_id] -= 1
+
+                if self.num_running_requests[prefill_server_id] == 0:
+                    self.ts_of_latest_prefill_idle = time.time()
+
+                # prefill_end = time.time()
 
                 # 3. Start decoding, receive and yield back response as a normal request
                 # The kv window passed through denotes the range to prefill on the
                 # decode server, which should be [-1:] here.
+
+                # moved from above prep_recv, better reflects decode batch size
+                self.num_running_requests[decode_server_id] += 1
+
                 start_generate_request = microserving_entrypoints.StartGenerateRequest(
                     **original_request.model_dump(),
                     begin=kv_window_end,
@@ -338,9 +379,20 @@ class Router:  # pylint: disable=too-many-instance-attributes
                         if finish_reason == "preempt":
                             yield None
                     yield response
+
+                # decode_end = time.time()
+
+                # with self.lock:
+                #     self.total_prep_recv_time += prep_recv_end - prep_recv_start
+                #     self.total_prefill_time += prefill_end - prep_recv_end
+                #     self.total_decode_time += decode_end - prefill_end
+                    # self.stats[req_num] = np.array([prep_recv_end - prep_recv_start, prefill_end - prep_recv_end, decode_end - prefill_end])
+                    # self.stats[req_num] = time.time()
+
             except Exception as e:
                 self.num_running_requests[decode_server_id] -= 1
                 raise e
+            
             self.num_running_requests[decode_server_id] -= 1
 
     async def send_prepare_receive(

@@ -800,7 +800,7 @@ def create_dataset(args: argparse.Namespace, tokenizer: AutoTokenizer) -> "Datas
             args.apply_chat_template is False
         ), "LLMPerf dataset does not support applying chat template"
         return LLMPerfDataset(
-            args.dataset_path, (args.num_requests + args.num_warmup_requests) * 4, tokenizer
+            args.dataset_path, args.num_requests + args.num_warmup_requests, tokenizer
         )
     if args.dataset == "json-mode-eval":
         assert (
