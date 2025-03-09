@@ -4,6 +4,8 @@ import json
 import math
 import threading
 from typing import Any, AsyncGenerator, Iterable, List, Literal, Optional, Tuple
+from enum import Enum, auto
+
 
 import aiohttp  # pylint: disable=import-error
 import tvm
@@ -15,6 +17,97 @@ from mlc_llm.serve.entrypoints import microserving_entrypoints
 from mlc_llm.tokenizers import Tokenizer
 
 import time
+
+class RatioAction(Enum):
+    NO_ACTION = auto()
+    TO_INCREASE = auto()
+    INCREASE = auto()
+    TO_DECREASE = auto()
+    DECREASE = auto()
+
+class OptimizeFor(Enum):
+    LATENCY = auto()
+    THROUGHPUT = auto()
+
+class OffloadController:
+    """Controller for the PD offload ratio"""
+
+    def __init__(self, router, optimize_for="latency", period=5, eval_periods=3, delta=0.05):
+        self.router = router
+        self.period = period
+        self.eval_periods = eval_periods
+        self.delta = delta
+        self.optimize_for = OptimizeFor.LATENCY if optimize_for == "latency" else OptimizeFor.THROUGHPUT
+
+        # keep track of internal states
+        self.prev_prefill_idle_duration = None
+        self.prev_prefill_val = None # either latency or thoroughput
+        self.prev_decode_val = None # either latency or thoroughput
+        self.valid_periods = 0
+        self.action = RatioAction.NO_ACTION
+
+        # thread
+        self._thread = threading.Thread(target=self._step, daemon=True)
+        self._thread.start()
+    
+    def _calculate_value(self):
+
+
+    def _step(self):
+        while True:
+            with self.router.lock:
+                # print(f"total idle time: {self.router.total_prefill_idle_time}")
+                # print(f"num_prefills_done: {self.router.num_prefills_done}")
+                # print(f"num_decodes_done: {self.router.num_decodes_done}")
+                # print(f"total_prefill_duration: {self.router.total_prefill_duration}")
+                # print(f"total_decode_duration: {self.router.total_decode_duration}")
+                if self.optimize_for == OptimizeFor.LATENCY:
+                    prefill_val = self.router.total_prefill_duration / self.router.num_prefills_done
+                    decode_val = self.router.total_decode_duration / self.router.num_decodes_done
+                else:
+                    prefill_val = self.router.num_prefills_done / self.period
+                    decode_val = self.router.num_decodes_done / self.period
+
+                if self.prev_prefill_idle_duration is not None:
+                    if self.optimize_for == OptimizeFor.LATENCY:
+                        match self.action:
+                            case RatioAction.INCREASE:
+                                if (prefill_val + decode_val) < (self.prev_prefill_val + self.prev_decode_val):
+                                    self.valid_periods += 1
+                                    if self.valid_periods == self.eval_periods:
+                                        self.router.pd_balance_factor += self.delta
+                                        self.valid_periods = 0
+                                else:
+                                    self.action = RatioAction.NO_ACTION
+                                    self.valid_periods = 0
+                            case RatioAction.DECREASE:
+                                if (prefill_val + decode_val) < (self.prev_prefill_val + self.prev_decode_val):
+                                    self.valid_periods += 1
+                                    if self.valid_periods == self.eval_periods:
+                                        self.router.pd_balance_factor -= self.delta
+                                        self.valid_periods = 0
+                                else:
+                                    self.action = RatioAction.NO_ACTION
+                                    self.valid_periods = 0
+
+                        del_idle_time = self.prev_prefill_idle_duration - self.router.total_prefill_idle_time
+                        if del_idle_time > 0:
+                
+                # assign values to prev values
+                self.prev_prefill_idle_duration = self.router.total_prefill_idle_time
+                self.prev_prefill_val = prefill_val
+                self.prev_decode_val = decode_val
+
+                # zero out the profiling variables
+                self.router.total_prefill_idle_time = 0.0
+                self.router.ts_of_latest_prefill_idle = None
+                self.router.num_prefills_done = 0
+                self.router.num_decodes_done = 0
+                self.router.total_prefill_duration = 0.0
+                self.router.total_decode_duration = 0.0     
+            
+            time.sleep(5)
+   
 
 class Router:  # pylint: disable=too-many-instance-attributes
     """Programmable Router Implementation"""
@@ -30,7 +123,7 @@ class Router:  # pylint: disable=too-many-instance-attributes
         router_mode: Literal["disagg", "round-robin"] = "disagg",
         pd_balance_factor: float = 0.0,
     ):  # pylint: disable=too-many-arguments,too-many-locals
-        print("trying fixed pd")
+        print(f"trying fixed pd {pd_balance_factor}")
         """
         Spawn len(host_list) server endpoints with Popen.
         """
@@ -71,17 +164,12 @@ class Router:  # pylint: disable=too-many-instance-attributes
 
         # added
         self.lock = threading.Lock()
-        # self.total_prefill_time = 0.
-        # self.total_decode_time = 0.
-        # self.total_prep_recv_time = 0.
-        self.num_requests = 0
-        self.request_num = -1
-        # self.init_time = time.time()
-        # self.stats = np.zeros((540, 1))
-        # self.prefill_time = 0.163440519 # for token length of 3000
+        self.num_prefills_done = 0
+        self.num_decodes_done = 0
         self.total_prefill_idle_time = 0.0
         self.ts_of_latest_prefill_idle = None
-        self.is_first_request = True
+        self.total_prefill_duration = 0.0
+        self.total_decode_duration = 0.0
 
         def start_server(i: int):
             nvshmem_config = {
@@ -120,6 +208,9 @@ class Router:  # pylint: disable=too-many-instance-attributes
             thread.join()
         self.tokenizer = Tokenizer(model)
 
+        # added controller
+        self.controller = OffloadController(self)
+
     def terminate(self):
         """Terminate the underlying servers"""
         for server in self.servers:
@@ -147,27 +238,8 @@ class Router:  # pylint: disable=too-many-instance-attributes
                     completed = False
                     break
                 yield response
-        
-        with self.lock:
-            self.num_requests += 1
+                    
 
-        if self.num_requests == 540:
-            # print(f"num_requests {self.num_requests}")
-            # print(f"Average Prep Recv Time: {self.total_prep_recv_time / self.num_requests}")
-            # print(f"Average Remote Send Time: {self.total_prefill_time / self.num_requests}")
-            # print(f"Average Start Generate Time: {self.total_decode_time / self.num_requests}")
-
-            # self.num_requests = 0
-            # self.total_prefill_time = 0.
-            # self.total_decode_time = 0.
-            # self.total_prep_recv_time = 0.
-
-            # with open("dummy.npy", "wb") as f:
-            #     np.save(f, self.stats)
-            if self.ts_of_latest_prefill_idle is not None:
-                self.total_prefill_idle_time += time.time() - self.ts_of_latest_prefill_idle
-            print(f"total_prefill_idle_time: {self.total_prefill_idle_time}")
-    
     async def translate_request(
         self, request: openai_api_protocol.CompletionRequest, request_id: str
     ) -> AsyncGenerator[openai_api_protocol.CompletionResponse, Any]:
@@ -279,14 +351,6 @@ class Router:  # pylint: disable=too-many-instance-attributes
         # P does not need to sample. Ask D to treat the last
         # token like the first sampled token.
         # print(f"pd_balance_factor = {pd_balance_factor:.3f}")
-        
-        # SCRAPPED: using the formula to adjust batch size
-        # def decode_time(batch_size) -> float:
-        #     return (0.0002 * batch_size) + 0.0095 # linear trendline on 
-        
-        # decode_batch_size = len(self.num_running_requests[decode_server_id])
-        # pd_balance_factor = 0.5 - ((decode_time(decode_batch_size) * 100) / (2 * self.prefill_time * decode_batch_size))
-
         kv_window_end = (
             -1
             if math.fabs(pd_balance_factor) < 1e-5
@@ -295,14 +359,15 @@ class Router:  # pylint: disable=too-many-instance-attributes
         async with aiohttp.ClientSession(
             timeout=aiohttp.ClientTimeout(total=3 * 3600), trust_env=True
         ) as session:
-            try:
-                with self.lock:
-                    self.request_num += 1
-                    # req_num = min(self.request_num, 539)
-                    # self.stats[req_num] = self.num_running_requests[decode_server_id]
-                    # self.stats[req_num] = time.time() - self.init_time
+            try:                
+                if self.num_running_requests[prefill_server_id] == 0:
+                    if self.ts_of_latest_prefill_idle is not None:
+                        self.total_prefill_idle_time += time.time() - self.ts_of_latest_prefill_idle
+                        self.ts_of_latest_prefill_idle = None
+                
+                self.num_running_requests[prefill_server_id] += 1     
 
-                # prep_recv_start = time.time()                
+                prefill_start = time.time()      
 
                 # 1. Ask D to prepare metadata
                 prep_recv_request = microserving_entrypoints.PrepRecvRequest(
@@ -327,16 +392,6 @@ class Router:  # pylint: disable=too-many-instance-attributes
                 # 2. Send P the prefill request and D's metadata. When it returns, it means that
                 # KV transfer has finished prefilling and transferring the KV of
                 # prompt[prefix_matched_length:kv_window_end]. So D is ready to decode.
-                
-                # prep_recv_end = time.time()
-
-                if self.num_running_requests[prefill_server_id] == 0:
-                    if self.ts_of_latest_prefill_idle is not None:
-                        self.total_prefill_idle_time += time.time() - self.ts_of_latest_prefill_idle
-                        self.ts_of_latest_prefill_idle = None
-                
-                self.num_running_requests[prefill_server_id] += 1
-
                 if prefix_matched_length < kv_window_end:
                     remote_send_request = microserving_entrypoints.RemoteSendRequest(
                         **original_request.model_dump(),
@@ -352,16 +407,17 @@ class Router:  # pylint: disable=too-many-instance-attributes
                     )
                 
                 self.num_running_requests[prefill_server_id] -= 1
-
                 if self.num_running_requests[prefill_server_id] == 0:
                     self.ts_of_latest_prefill_idle = time.time()
-
-                # prefill_end = time.time()
+                
+                prefill_end = time.time()
+                with self.lock:
+                    self.num_prefills_done += 1
 
                 # 3. Start decoding, receive and yield back response as a normal request
                 # The kv window passed through denotes the range to prefill on the
                 # decode server, which should be [-1:] here.
-
+                
                 # moved from above prep_recv, better reflects decode batch size
                 self.num_running_requests[decode_server_id] += 1
 
@@ -379,15 +435,12 @@ class Router:  # pylint: disable=too-many-instance-attributes
                         if finish_reason == "preempt":
                             yield None
                     yield response
-
-                # decode_end = time.time()
-
-                # with self.lock:
-                #     self.total_prep_recv_time += prep_recv_end - prep_recv_start
-                #     self.total_prefill_time += prefill_end - prep_recv_end
-                #     self.total_decode_time += decode_end - prefill_end
-                    # self.stats[req_num] = np.array([prep_recv_end - prep_recv_start, prefill_end - prep_recv_end, decode_end - prefill_end])
-                    # self.stats[req_num] = time.time()
+            
+                decode_end = time.time()
+                with self.lock:
+                    self.num_decodes_done += 1
+                    self.total_prefill_duration += prefill_end - prefill_start
+                    self.total_decode_duration += decode_end - prefill_end
 
             except Exception as e:
                 self.num_running_requests[decode_server_id] -= 1

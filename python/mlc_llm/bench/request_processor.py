@@ -287,13 +287,16 @@ class WarmupAndRun(RequestProcessor):  # pylint: disable=too-few-public-methods,
             )
         else:
             assert len(request_records) == self.num_warmup_requests + self.num_benchmark_requests
-            benchmark_requests = request_records[: -self.num_warmup_requests]
-            warmup_requests = request_records[-self.num_warmup_requests :]
-        for request_record in warmup_requests:
-            request_record.timestamp = 0 if request_record.timestamp is not None else None
-        warmup_requests = self._process_warmup_requests(warmup_requests)
-        logger.info("Warmup with %d request(s)...", self.num_warmup_requests)
-        self.pipeline(warmup_requests)
+            if self.num_warmup_requests == 0:
+                benchmark_requests = request_records
+            else:
+                benchmark_requests = request_records[: -self.num_warmup_requests]
+                warmup_requests = request_records[-self.num_warmup_requests :]
+                for request_record in warmup_requests:
+                    request_record.timestamp = 0 if request_record.timestamp is not None else None
+                warmup_requests = self._process_warmup_requests(warmup_requests)
+                logger.info("Warmup with %d request(s)...", self.num_warmup_requests)
+                self.pipeline(warmup_requests)
 
         # Then run benchmark
         if self.cuda_profile_url is not None:
