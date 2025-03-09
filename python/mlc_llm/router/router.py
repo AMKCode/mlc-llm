@@ -149,14 +149,22 @@ class OffloadController:
                     else:
                         assert False, "not implemented"
                 else:
+                    # the only times when this is entered is if num_running_requests[prefill_server_id] == 0
+                    self.action = RatioAction.NO_ACTION
+                    self.router.pd_balance_factor = 0.0
+                    self.valid_periods = 0
                     self.prev_prefill_idle_time = self.router.total_prefill_idle_time
                 
                 # update prev values
                 self.prev_prefill_val = prefill_val
                 self.prev_decode_val = decode_val
 
+                prefill_server_id = 0
+                # prevent the case where prev_prefill_idle_time is not None but total_prefill_idle_time is None
+                self.prev_prefill_idle_time = None if self.router.num_running_requests[prefill_server_id] == 0 else self.prev_prefill_idle_time
+
                 # zero out the profiling variables
-                self.router.total_prefill_idle_time = None if self.router.num_running_requests[0] == 0 else 0.0
+                self.router.total_prefill_idle_time = None if self.router.num_running_requests[prefill_server_id] == 0 else 0.0
                 self.router.ts_of_latest_prefill_idle = None
                 self.router.num_prefills_done = 0
                 self.router.num_decodes_done = 0
@@ -270,7 +278,7 @@ class Router:  # pylint: disable=too-many-instance-attributes
         self.tokenizer = Tokenizer(model)
 
         # added controller
-        # self.controller = OffloadController(self, period=2)
+        self.controller = OffloadController(self, period=2)
 
     def terminate(self):
         """Terminate the underlying servers"""
