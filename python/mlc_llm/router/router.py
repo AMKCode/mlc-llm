@@ -32,7 +32,7 @@ class OptimizeFor(Enum):
 class OffloadController:
     """Controller for the PD offload ratio"""
 
-    def __init__(self, router, optimize_for="latency", period=5, eval_periods=3, delta=0.05, epsilon=0.05, min_idle_time=0.0, max_idle_time=10.0):
+    def __init__(self, router, optimize_for="latency", period=5, eval_periods=3, delta=0.10, epsilon=0.05, min_idle_time=0.0, max_idle_time=10.0):
         self.router = router
         self.period = period
         self.eval_periods = eval_periods
@@ -70,6 +70,7 @@ class OffloadController:
 
                 print(f"prefill_val: {prefill_val}")
                 print(f"decode_val: {decode_val}")
+                print(f"prev_delta_val: {self.prev_delta_val}")
                 print(f"delta_val: {delta_val}")
                 print(f"idle_time: {self.router.total_prefill_idle_time}")
 
@@ -79,90 +80,112 @@ class OffloadController:
                             case RatioAction.INCREASE:
                                 if delta_val < self.prev_delta_val:
                                     self.valid_periods += 1
-                                    if self.valid_periods == self.eval_periods:
-                                        self.router.pd_balance_factor = min(0.5, self.router.pd_balance_factor + self.delta)
+                                    if self.valid_periods <= self.eval_periods:
+                                        print("during increase")
+                                        self.router.pd_balance_factor = min(0.9, self.router.pd_balance_factor + self.delta)
                                         self.valid_periods = 0
+                                        
+                                        self.prev_delta_val = delta_val
                                 else:
-                                    self.action = RatioAction.NO_ACTION
-                                    self.valid_periods = 0
-                                    
-                                    self.prev_prefill_idle_time = self.router.total_prefill_idle_time
+                                    self.valid_periods -= 1
+                                    if self.valid_periods <= 0:
+                                        self.action = RatioAction.NO_ACTION
+                                        self.prev_prefill_idle_time = self.router.total_prefill_idle_time
                             case RatioAction.DECREASE:
                                 if delta_val < self.prev_delta_val:
                                     self.valid_periods += 1
-                                    if self.valid_periods == self.eval_periods:
+                                    if self.valid_periods <= self.eval_periods:
                                         self.router.pd_balance_factor = max(0.0, self.router.pd_balance_factor - self.delta)
                                         self.valid_periods = 0
-                                else:
-                                    self.action = RatioAction.NO_ACTION
-                                    self.valid_periods = 0
 
-                                    self.prev_prefill_idle_time = self.router.total_prefill_idle_time
+                                        self.prev_delta_val = delta_val
+                                else:
+                                    self.valid_periods -= 1
+                                    if self.valid_periods <= 0:
+                                        self.action = RatioAction.NO_ACTION
+                                        self.prev_prefill_idle_time = self.router.total_prefill_idle_time
                             case RatioAction.TO_INCREASE:
-                                if (self.router.total_prefill_idle_time <= self.min_idle_time) or ((self.prev_prefill_idle_time - self.router.total_prefill_idle_time) > self.epsilon):
+                                if (self.router.total_prefill_idle_time <= self.min_idle_time) or \
+                                   ((self.prev_prefill_idle_time - self.router.total_prefill_idle_time) > self.epsilon):
                                     self.valid_periods += 1
-                                    if self.valid_periods == self.eval_periods:
+                                    if self.valid_periods <= self.eval_periods:
                                         # enter INCREASE stage
                                         self.action = RatioAction.INCREASE
-                                        self.router.pd_balance_factor = min(0.5, self.router.pd_balance_factor + self.delta)
+                                        self.router.pd_balance_factor = min(0.9, self.router.pd_balance_factor + self.delta)
                                         self.valid_periods = 0
-                                else:
-                                    self.action = RatioAction.NO_ACTION
-                                    self.valid_periods = 0
 
-                                    self.prev_prefill_idle_time = self.router.total_prefill_idle_time
+                                        self.prev_delta_val = delta_val
+                                else:
+                                    self.valid_periods -= 1
+                                    if self.valid_periods <= 0:
+                                        self.action = RatioAction.NO_ACTION
+                                        self.prev_prefill_idle_time = self.router.total_prefill_idle_time
                             case RatioAction.TO_DECREASE:
-                                if (self.router.total_prefill_idle_time >= self.max_idle_time) or ((self.router.total_prefill_idle_time - self.prev_prefill_idle_time) > self.epsilon):
+                                if (self.router.total_prefill_idle_time >= self.max_idle_time) or \
+                                   ((self.router.total_prefill_idle_time - self.prev_prefill_idle_time) > self.epsilon) or \
+                                   (self.router.pd_balance_factor >= 0.5):
                                     self.valid_periods += 1
-                                    if self.valid_periods == self.eval_periods:
+                                    if self.valid_periods <= self.eval_periods:
                                         # enter DECREASE stage
                                         self.action = RatioAction.DECREASE
                                         self.router.pd_balance_factor = max(0.0, self.router.pd_balance_factor - self.delta)
                                         self.valid_periods = 0
+
+                                        self.prev_delta_val = delta_val
                                 else:
-                                    self.action = RatioAction.NO_ACTION
-                                    self.valid_periods = 0
-
-                                    self.prev_prefill_idle_time = self.router.total_prefill_idle_time
+                                    self.valid_periods -= 1
+                                    if self.valid_periods <= 0:
+                                        self.action = RatioAction.NO_ACTION
+                                        self.prev_prefill_idle_time = self.router.total_prefill_idle_time
                             case RatioAction.NO_ACTION:
-                                if (self.router.total_prefill_idle_time <= self.min_idle_time) or ((self.prev_prefill_idle_time - self.router.total_prefill_idle_time) > self.epsilon):
-                                    # enter TO_INCREASE stage
-                                    self.action = RatioAction.TO_INCREASE
-                                    self.valid_periods = 1
-
-                                    # handles case where self.eval_periods is 1
-                                    if self.valid_periods == self.eval_periods:
-                                        # enter INCREASE stage
-                                        self.action = RatioAction.INCREASE
-                                        self.router.pd_balance_factor = min(0.5, self.router.pd_balance_factor + self.delta)
-                                        self.valid_periods = 0
-                                if (self.router.total_prefill_idle_time >= self.max_idle_time) or ((self.router.total_prefill_idle_time - self.prev_prefill_idle_time) > self.epsilon):
+                                if (self.router.total_prefill_idle_time >= self.max_idle_time) or \
+                                   ((self.router.total_prefill_idle_time - self.prev_prefill_idle_time) > self.epsilon) or \
+                                   (self.router.pd_balance_factor >= 0.5):
                                     # enter TO_DECREASE stage
                                     self.action = RatioAction.TO_DECREASE
-                                    self.valid_periods = 1
+                                    self.valid_periods = self.eval_periods
                                     
                                     # handles case where self.eval_periods is 1
-                                    if self.valid_periods == self.eval_periods:
+                                    if self.valid_periods <= self.eval_periods:
                                         # enter DECREASE stage
                                         self.action = RatioAction.DECREASE
                                         self.router.pd_balance_factor = max(0.0, self.router.pd_balance_factor - self.delta)
                                         self.valid_periods = 0
+
+                                        self.prev_delta_val = delta_val
+                                elif (self.router.total_prefill_idle_time <= self.min_idle_time) or \
+                                     ((self.prev_prefill_idle_time - self.router.total_prefill_idle_time) > self.epsilon):
+                                    # enter TO_INCREASE stage
+                                    self.action = RatioAction.TO_INCREASE
+                                    self.valid_periods = self.eval_periods
+
+                                    # handles case where self.eval_periods is 1
+                                    if self.valid_periods <= self.eval_periods:
+                                        # enter INCREASE stage
+                                        self.action = RatioAction.INCREASE
+                                        print("before increase")
+                                        self.router.pd_balance_factor = min(0.9, self.router.pd_balance_factor + self.delta)
+                                        self.valid_periods = 0
+
+                                        self.prev_delta_val = delta_val
                                 else:
                                     self.prev_prefill_idle_time = self.router.total_prefill_idle_time
+                                    
+                                    self.prev_delta_val = delta_val
                     else:
                         assert False, "not implemented"
                 else:
                     # the only times when this is entered is if num_running_requests[prefill_server_id] == 0
                     self.action = RatioAction.NO_ACTION
-                    # self.router.pd_balance_factor = 0.0
+                    self.router.pd_balance_factor = 0.0
                     self.valid_periods = 0
                     self.prev_prefill_idle_time = self.router.total_prefill_idle_time
-                
-                # update prev values
+
+                    self.prev_delta_val = delta_val
+            
                 self.prev_prefill_val = prefill_val
                 self.prev_decode_val = decode_val
-                self.prev_delta_val = delta_val
-
+            
                 prefill_server_id = 0
                 # prevent the case where prev_prefill_idle_time is not None but total_prefill_idle_time is None
                 self.prev_prefill_idle_time = None if self.router.num_running_requests[prefill_server_id] == 0 else self.prev_prefill_idle_time
@@ -174,7 +197,6 @@ class OffloadController:
                 self.router.num_decodes_done = 0
                 self.router.total_prefill_duration = 0.0
                 self.router.total_decode_duration = 0.0   
-
                 print(f"action: {self.action}")
                 print(f"valid_periods: {self.valid_periods}")
                 print(f"pd_balance_factor: {self.router.pd_balance_factor}")
@@ -282,7 +304,7 @@ class Router:  # pylint: disable=too-many-instance-attributes
         self.tokenizer = Tokenizer(model)
 
         # added controller
-        self.controller = OffloadController(self, period=2)
+        self.controller = OffloadController(self)
 
     def terminate(self):
         """Terminate the underlying servers"""
