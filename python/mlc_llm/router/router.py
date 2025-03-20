@@ -48,17 +48,21 @@ class OffloadController:
         self.prev_decode_val = 0.0 # either latency or thoroughput
         self.prev_delta_val = 0.0
         self.valid_periods = 0
-        self.first_adjustment = False
         self.action = RatioAction.NO_ACTION
+
+        # take into account of "probing" adjustments
+        self.first_adjustment = False
+        self.prev_pd_factor = None
 
         # thread
         self._thread = threading.Thread(target=self._step, daemon=True)
         self._thread.start()
     
-
     def _step(self):
         while True:
+            time.sleep(self.period)
             with self.router.lock:
+                self.router.total_prefill_idle_time += (time.time() - self.router.ts_of_latest_prefill_idle) if self.router.ts_of_latest_prefill_idle is not None else 0.0
                 if self.optimize_for == OptimizeFor.LATENCY:
                     eps = 1e-10 # prevent division by 0
                     prefill_val = self.router.total_prefill_duration / (self.router.num_prefills_done + eps)
@@ -75,7 +79,7 @@ class OffloadController:
                 print(f"delta_val: {delta_val}")
                 print(f"idle_time: {self.router.total_prefill_idle_time}")
 
-                if self.prev_prefill_idle_time is not None:
+                if self.router.total_prefill_idle_time < self.period: # meaning no requests came through during the period
                     if self.optimize_for == OptimizeFor.LATENCY:
                         match self.action:
                             case RatioAction.INCREASE:
@@ -83,7 +87,7 @@ class OffloadController:
                                     self.valid_periods += 1
                                     if self.valid_periods >= self.eval_periods:
                                         self.first_adjustment = False
-                                        self.router.pd_balance_factor = min(0.9, self.router.pd_balance_factor + self.delta)
+                                        self.router.pd_balance_factor = min(1.0, self.router.pd_balance_factor + self.delta)
                                         self.valid_periods = 0
                                         
                                         self.prev_delta_val = delta_val
@@ -92,7 +96,7 @@ class OffloadController:
                                     if self.valid_periods <= 0:
                                         self.action = RatioAction.NO_ACTION
                                         if self.first_adjustment:
-                                            self.router.pd_balance_factor = max(0.0, self.router.pd_balance_factor - self.delta)
+                                            self.router.pd_balance_factor = self.prev_pd_factor
                                         self.prev_prefill_idle_time = self.router.total_prefill_idle_time
                             case RatioAction.DECREASE:
                                 if delta_val < self.prev_delta_val:
@@ -108,7 +112,7 @@ class OffloadController:
                                     if self.valid_periods <= 0:
                                         self.action = RatioAction.NO_ACTION
                                         if self.first_adjustment:
-                                            self.router.pd_balance_factor = min(0.9, self.router.pd_balance_factor + self.delta)
+                                            self.router.pd_balance_factor = self.prev_pd_factor
                                         self.prev_prefill_idle_time = self.router.total_prefill_idle_time
                             case RatioAction.TO_INCREASE:
                                 assert False, "TO_INCREASE not used"
@@ -118,7 +122,7 @@ class OffloadController:
                                     if self.valid_periods >= self.eval_periods:
                                         # enter INCREASE stage
                                         self.action = RatioAction.INCREASE
-                                        self.router.pd_balance_factor = min(0.9, self.router.pd_balance_factor + self.delta)
+                                        self.router.pd_balance_factor = min(1.0, self.router.pd_balance_factor + self.delta)
                                         self.valid_periods = 0
 
                                         self.prev_delta_val = delta_val
@@ -131,7 +135,7 @@ class OffloadController:
                                 assert False, "TO_DECREASE not used"
                                 if (self.router.total_prefill_idle_time >= self.max_idle_time) or \
                                    ((self.router.total_prefill_idle_time - self.prev_prefill_idle_time) > self.epsilon) or \
-                                   (self.router.pd_balance_factor <= 0.5):
+                                   (self.router.pd_balance_factor >= 0.5):
                                     self.valid_periods += 1
                                     if self.valid_periods >= self.eval_periods:
                                         # enter DECREASE stage
@@ -146,8 +150,7 @@ class OffloadController:
                                         self.action = RatioAction.NO_ACTION
                                         self.prev_prefill_idle_time = self.router.total_prefill_idle_time
                             case RatioAction.NO_ACTION:
-                                if (self.router.total_prefill_idle_time <= self.min_idle_time) or \
-                                     ((self.prev_prefill_idle_time - self.router.total_prefill_idle_time) > self.epsilon):
+                                if (self.router.total_prefill_idle_time <= self.min_idle_time):
                                     # enter TO_INCREASE stage
                                     self.action = RatioAction.TO_INCREASE
                                     self.valid_periods = self.eval_periods
@@ -156,14 +159,16 @@ class OffloadController:
                                     if self.valid_periods >= self.eval_periods:
                                         # enter INCREASE stage
                                         self.action = RatioAction.INCREASE
+
                                         self.first_adjustment = True
-                                        self.router.pd_balance_factor = min(0.9, self.router.pd_balance_factor + self.delta)
+                                        self.prev_pd_factor = self.router.pd_balance_factor
+
+                                        self.router.pd_balance_factor = min(1.0, self.router.pd_balance_factor + self.delta)
                                         self.valid_periods = 0
 
                                         self.prev_delta_val = delta_val
                                 elif (self.router.total_prefill_idle_time >= self.max_idle_time) or \
-                                   ((self.router.total_prefill_idle_time - self.prev_prefill_idle_time) > self.epsilon) or \
-                                   (self.router.pd_balance_factor <= 0.5):
+                                   (self.router.pd_balance_factor >= 0.5):
                                     # enter TO_DECREASE stage
                                     self.action = RatioAction.TO_DECREASE
                                     self.valid_periods = self.eval_periods
@@ -172,7 +177,10 @@ class OffloadController:
                                     if self.valid_periods >= self.eval_periods:
                                         # enter DECREASE stage
                                         self.action = RatioAction.DECREASE
+
                                         self.first_adjustment = True
+                                        self.prev_pd_factor = self.router.pd_balance_factor
+
                                         self.router.pd_balance_factor = max(0.0, self.router.pd_balance_factor - self.delta)
                                         self.valid_periods = 0
 
@@ -183,34 +191,31 @@ class OffloadController:
                     else:
                         assert False, "not implemented"
                 else:
-                    # the only times when this is entered is if num_running_requests[prefill_server_id] == 0
+                    # the only times when this is entered is if there are no requests during the period
                     self.action = RatioAction.NO_ACTION
-                    # self.router.pd_balance_factor = 0.0
+                    self.router.pd_balance_factor = 0.0
                     self.valid_periods = 0
-                    self.prev_prefill_idle_time = self.router.total_prefill_idle_time
-
                     self.prev_delta_val = delta_val
             
                 self.prev_prefill_val = prefill_val
                 self.prev_decode_val = decode_val
             
                 prefill_server_id = 0
-                # prevent the case where prev_prefill_idle_time is not None but total_prefill_idle_time is None
-                self.prev_prefill_idle_time = None if self.router.num_running_requests[prefill_server_id] == 0 else self.prev_prefill_idle_time
+                self.prev_prefill_idle_time = self.router.total_prefill_idle_time
+
+                # DELETE THIS LINE
+                # self.router.pd_balance_factor = 1.0
 
                 # zero out the profiling variables
-                self.router.total_prefill_idle_time = None if self.router.num_running_requests[prefill_server_id] == 0 else 0.0
-                self.router.ts_of_latest_prefill_idle = None
+                self.router.total_prefill_idle_time = 0.0
+                self.router.ts_of_latest_prefill_idle = time.time() if self.router.num_running_requests[prefill_server_id] == 0 else None
                 self.router.num_prefills_done = 0
                 self.router.num_decodes_done = 0
                 self.router.total_prefill_duration = 0.0
                 self.router.total_decode_duration = 0.0   
                 print(f"action: {self.action}")
                 print(f"valid_periods: {self.valid_periods}")
-                print(f"pd_balance_factor: {self.router.pd_balance_factor}")
-            
-            time.sleep(self.period)
-   
+                print(f"pd_balance_factor: {self.router.pd_balance_factor}")   
 
 class Router:  # pylint: disable=too-many-instance-attributes
     """Programmable Router Implementation"""
@@ -269,8 +274,8 @@ class Router:  # pylint: disable=too-many-instance-attributes
         self.lock = threading.Lock()
         self.num_prefills_done = 0
         self.num_decodes_done = 0
-        self.total_prefill_idle_time = None
-        self.ts_of_latest_prefill_idle = None
+        self.total_prefill_idle_time = 0.0
+        self.ts_of_latest_prefill_idle = 0.0
         self.total_prefill_duration = 0.0
         self.total_decode_duration = 0.0
 
@@ -312,6 +317,7 @@ class Router:  # pylint: disable=too-many-instance-attributes
         self.tokenizer = Tokenizer(model)
 
         # added controller
+        self.ts_of_latest_prefill_idle = time.time()
         self.controller = OffloadController(self)
 
     def terminate(self):
@@ -466,10 +472,7 @@ class Router:  # pylint: disable=too-many-instance-attributes
                 with self.lock:
                     if self.num_running_requests[prefill_server_id] == 0:
                         if self.ts_of_latest_prefill_idle is not None:
-                            if self.total_prefill_idle_time is None:
-                                self.total_prefill_idle_time = time.time() - self.ts_of_latest_prefill_idle
-                            else:
-                                self.total_prefill_idle_time += time.time() - self.ts_of_latest_prefill_idle
+                            self.total_prefill_idle_time += time.time() - self.ts_of_latest_prefill_idle
                             self.ts_of_latest_prefill_idle = None
                 
                 self.num_running_requests[prefill_server_id] += 1     
