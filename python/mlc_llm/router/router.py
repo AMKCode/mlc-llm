@@ -32,27 +32,12 @@ class OptimizeFor(Enum):
 class OffloadController:
     """Controller for the PD offload ratio"""
 
-    def __init__(self, router, optimize_for="latency", period=5, eval_periods=2, delta=0.10, epsilon=0.05):
+    def __init__(self, router, optimize_for="latency", period=5):
         self.router = router
         self.period = period
-        self.eval_periods = eval_periods
-        self.delta = delta
-        self.epsilon = epsilon # for prefill idle time
         self.min_idle_time = 0.0
         self.max_idle_time = period * 0.2 # 20% of the time the engine is idle
         self.optimize_for = OptimizeFor.LATENCY if optimize_for == "latency" else OptimizeFor.THROUGHPUT
-
-        # keep track of internal states
-        self.prev_prefill_idle_time = None
-        self.prev_prefill_val = 0.0 # either latency or thoroughput
-        self.prev_decode_val = 0.0 # either latency or thoroughput
-        self.prev_delta_val = 0.0
-        self.valid_periods = 0
-        self.action = RatioAction.NO_ACTION
-
-        # take into account of "probing" adjustments
-        self.first_adjustment = False
-        self.prev_pd_factor = None
 
         # thread
         self._thread = threading.Thread(target=self._step, daemon=True)
@@ -62,159 +47,47 @@ class OffloadController:
         while True:
             time.sleep(self.period)
             with self.router.lock:
-                self.router.total_prefill_idle_time += (time.time() - self.router.ts_of_latest_prefill_idle) if self.router.ts_of_latest_prefill_idle is not None else 0.0
-                if self.optimize_for == OptimizeFor.LATENCY:
-                    eps = 1e-10 # prevent division by 0
-                    prefill_val = self.router.total_prefill_duration / (self.router.num_prefills_done + eps)
-                    decode_val = self.router.total_decode_duration / (self.router.num_decodes_done + eps)
-                else: # throughput
-                    prefill_val = self.router.num_prefills_done / self.period
-                    decode_val = self.router.num_decodes_done / self.period
-                
-                delta_val = (prefill_val + decode_val) - (self.prev_prefill_val + self.prev_decode_val)
-
-                print(f"prefill_val: {prefill_val}")
-                print(f"decode_val: {decode_val}")
-                print(f"prev_delta_val: {self.prev_delta_val}")
-                print(f"delta_val: {delta_val}")
-                print(f"idle_time: {self.router.total_prefill_idle_time}")
-
-                if self.router.total_prefill_idle_time < self.period: # meaning no requests came through during the period
-                    if self.optimize_for == OptimizeFor.LATENCY:
-                        match self.action:
-                            case RatioAction.INCREASE:
-                                if delta_val < self.prev_delta_val:
-                                    self.valid_periods += 1
-                                    if self.valid_periods >= self.eval_periods:
-                                        self.first_adjustment = False
-                                        self.router.pd_balance_factor = min(1.0, self.router.pd_balance_factor + self.delta)
-                                        self.valid_periods = 0
-                                        
-                                        self.prev_delta_val = delta_val
-                                else:
-                                    self.valid_periods -= 1
-                                    if self.valid_periods <= 0:
-                                        self.action = RatioAction.NO_ACTION
-                                        if self.first_adjustment:
-                                            self.router.pd_balance_factor = self.prev_pd_factor
-                                        self.prev_prefill_idle_time = self.router.total_prefill_idle_time
-                            case RatioAction.DECREASE:
-                                if delta_val < self.prev_delta_val:
-                                    self.valid_periods += 1
-                                    if self.valid_periods >= self.eval_periods:
-                                        self.first_adjustment = False
-                                        self.router.pd_balance_factor = max(0.0, self.router.pd_balance_factor - self.delta)
-                                        self.valid_periods = 0
-
-                                        self.prev_delta_val = delta_val
-                                else:
-                                    self.valid_periods -= 1
-                                    if self.valid_periods <= 0:
-                                        self.action = RatioAction.NO_ACTION
-                                        if self.first_adjustment:
-                                            self.router.pd_balance_factor = self.prev_pd_factor
-                                        self.prev_prefill_idle_time = self.router.total_prefill_idle_time
-                            case RatioAction.TO_INCREASE:
-                                assert False, "TO_INCREASE not used"
-                                if (self.router.total_prefill_idle_time <= self.min_idle_time) or \
-                                   ((self.prev_prefill_idle_time - self.router.total_prefill_idle_time) > self.epsilon):
-                                    self.valid_periods += 1
-                                    if self.valid_periods >= self.eval_periods:
-                                        # enter INCREASE stage
-                                        self.action = RatioAction.INCREASE
-                                        self.router.pd_balance_factor = min(1.0, self.router.pd_balance_factor + self.delta)
-                                        self.valid_periods = 0
-
-                                        self.prev_delta_val = delta_val
-                                else:
-                                    self.valid_periods -= 1
-                                    if self.valid_periods <= 0:
-                                        self.action = RatioAction.NO_ACTION
-                                        self.prev_prefill_idle_time = self.router.total_prefill_idle_time
-                            case RatioAction.TO_DECREASE:
-                                assert False, "TO_DECREASE not used"
-                                if (self.router.total_prefill_idle_time >= self.max_idle_time) or \
-                                   ((self.router.total_prefill_idle_time - self.prev_prefill_idle_time) > self.epsilon) or \
-                                   (self.router.pd_balance_factor >= 0.5):
-                                    self.valid_periods += 1
-                                    if self.valid_periods >= self.eval_periods:
-                                        # enter DECREASE stage
-                                        self.action = RatioAction.DECREASE
-                                        self.router.pd_balance_factor = max(0.0, self.router.pd_balance_factor - self.delta)
-                                        self.valid_periods = 0
-
-                                        self.prev_delta_val = delta_val
-                                else:
-                                    self.valid_periods -= 1
-                                    if self.valid_periods <= 0:
-                                        self.action = RatioAction.NO_ACTION
-                                        self.prev_prefill_idle_time = self.router.total_prefill_idle_time
-                            case RatioAction.NO_ACTION:
-                                if (self.router.total_prefill_idle_time <= self.min_idle_time):
-                                    # enter TO_INCREASE stage
-                                    self.action = RatioAction.TO_INCREASE
-                                    self.valid_periods = self.eval_periods
-
-                                    # handles case where self.eval_periods is 1
-                                    if self.valid_periods >= self.eval_periods:
-                                        # enter INCREASE stage
-                                        self.action = RatioAction.INCREASE
-
-                                        self.first_adjustment = True
-                                        self.prev_pd_factor = self.router.pd_balance_factor
-
-                                        self.router.pd_balance_factor = min(1.0, self.router.pd_balance_factor + self.delta)
-                                        self.valid_periods = 0
-
-                                        self.prev_delta_val = delta_val
-                                elif (self.router.total_prefill_idle_time >= self.max_idle_time) or \
-                                   (self.router.pd_balance_factor >= 0.5):
-                                    # enter TO_DECREASE stage
-                                    self.action = RatioAction.TO_DECREASE
-                                    self.valid_periods = self.eval_periods
-                                    
-                                    # handles case where self.eval_periods is 1
-                                    if self.valid_periods >= self.eval_periods:
-                                        # enter DECREASE stage
-                                        self.action = RatioAction.DECREASE
-
-                                        self.first_adjustment = True
-                                        self.prev_pd_factor = self.router.pd_balance_factor
-
-                                        self.router.pd_balance_factor = max(0.0, self.router.pd_balance_factor - self.delta)
-                                        self.valid_periods = 0
-
-                                        self.prev_delta_val = delta_val
-                                else: # stay in NO_ACTION
-                                    self.prev_prefill_idle_time = self.router.total_prefill_idle_time
-                                    self.prev_delta_val = delta_val
-                    else:
-                        assert False, "not implemented"
-                else:
-                    # the only times when this is entered is if there are no requests during the period
-                    self.action = RatioAction.NO_ACTION
-                    self.router.pd_balance_factor = 0.0
-                    self.valid_periods = 0
-                    self.prev_delta_val = delta_val
-            
-                self.prev_prefill_val = prefill_val
-                self.prev_decode_val = decode_val
-            
                 prefill_server_id = 0
-                self.prev_prefill_idle_time = self.router.total_prefill_idle_time
-
+                self.router.total_prefill_idle_time += (time.time() - self.router.ts_of_latest_prefill_idle) if self.router.ts_of_latest_prefill_idle is not None else 0.0
+                proj_request_rate = self.router.num_requests / self.period
+                proj_prefill_throughput = self.router.num_prefills_done / self.period
+                proj_num_requests = proj_request_rate * self.period
+                proj_t_prefill = self.router.estimate_prefill_time(self.router.avg_request_len)
+                avg_decode_len = 100 # fixed
+                
+                print(f"idle_time: {self.router.total_prefill_idle_time}")
+                print(f"request_rate: {proj_request_rate}")
+                print(f"prefill_throughput: {proj_prefill_throughput}")
+                print(f"sum_t_prefill_prefill: {self.router.sum_t_prefill_prefill}")
+                print(f"sum_t_prefill_decode: {self.router.sum_t_prefill_decode}")
+                print(f"num requests in decode {self.router.num_running_requests[1]}")
+                print(f"avg_request_len: {self.router.avg_request_len}")
+                
+                # computation
+                # pd_ratio = (self.router.sum_t_prefill_prefill + \
+                #             (0.5 * proj_t_prefill * (proj_num_requests - 1)) - \
+                #             ((proj_num_requests + 1) / (2 * proj_request_rate + 1e-5)) - \
+                #             self.router.sum_t_prefill_decode + \
+                #             ((proj_num_requests + 1) / (2 * proj_prefill_throughput + 1e-5))) / \
+                #             (proj_t_prefill * (proj_num_requests - 1) + 1e-5)
+                
+                pd_ratio = (self.router.sum_t_prefill_prefill - \
+                            self.router.sum_t_prefill_decode + \
+                            (proj_num_requests * proj_t_prefill) - \
+                            (((self.router.num_running_requests[prefill_server_id] + proj_num_requests - 1) / (proj_prefill_throughput + 1e-5)) + (avg_decode_len * 0.00775))) / \
+                            (2 * proj_t_prefill * proj_num_requests + 1e-5)
+                print(f"calculated pd ratio: {pd_ratio}")
+                self.router.pd_balance_factor = float(np.clip(pd_ratio, 0.0, 1.0))
+            
                 # DELETE THIS LINE
-                # self.router.pd_balance_factor = 1.0
+                # self.router.pd_balance_factor = 0.3
 
                 # zero out the profiling variables
+                # we don't zero out self.avg_request_len because it gets automatically zeroed out when we recieve the first request after the period ends
                 self.router.total_prefill_idle_time = 0.0
                 self.router.ts_of_latest_prefill_idle = time.time() if self.router.num_running_requests[prefill_server_id] == 0 else None
                 self.router.num_prefills_done = 0
-                self.router.num_decodes_done = 0
-                self.router.total_prefill_duration = 0.0
-                self.router.total_decode_duration = 0.0   
-                print(f"action: {self.action}")
-                print(f"valid_periods: {self.valid_periods}")
+                self.router.num_requests = 0
                 print(f"pd_balance_factor: {self.router.pd_balance_factor}")   
 
 class Router:  # pylint: disable=too-many-instance-attributes
@@ -270,14 +143,18 @@ class Router:  # pylint: disable=too-many-instance-attributes
             self.device_id_starts.append(self.device_id_starts[-1] + num_gpus_val)
         # device_id_starts[-1] is the total number of GPUs.
 
-        # added
+        # profiling variables
         self.lock = threading.Lock()
         self.num_prefills_done = 0
-        self.num_decodes_done = 0
         self.total_prefill_idle_time = 0.0
         self.ts_of_latest_prefill_idle = 0.0
-        self.total_prefill_duration = 0.0
-        self.total_decode_duration = 0.0
+        self.num_requests = 0
+        self.avg_request_len = 0
+
+        # sum of the time for queued prefill in the prefill engine
+        self.sum_t_prefill_prefill = 0.0
+        # sum of the time for queued prefill in the decode engine
+        self.sum_t_prefill_decode = 0.0
 
         def start_server(i: int):
             nvshmem_config = {
@@ -320,6 +197,9 @@ class Router:  # pylint: disable=too-many-instance-attributes
         self.ts_of_latest_prefill_idle = time.time()
         self.controller = OffloadController(self)
 
+    def estimate_prefill_time(self, request_len: int):
+        return (request_len * 0.00005605) + 0.000002299
+    
     def terminate(self):
         """Terminate the underlying servers"""
         for server in self.servers:
@@ -459,7 +339,7 @@ class Router:  # pylint: disable=too-many-instance-attributes
         # Tell D to prepare metadata for prompt[0:kv_window_end].
         # P does not need to sample. Ask D to treat the last
         # token like the first sampled token.
-        print(f"in_request pd_balance_factor = {pd_balance_factor:.3f}")
+        # print(f"in_request pd_balance_factor = {pd_balance_factor:.3f}")
         kv_window_end = (
             -1
             if math.fabs(pd_balance_factor) < 1e-5
@@ -470,14 +350,15 @@ class Router:  # pylint: disable=too-many-instance-attributes
         ) as session:
             try:
                 with self.lock:
+                    self.num_requests += 1
+                    self.avg_request_len = int(((self.num_requests - 1) * self.avg_request_len + len(original_request.prompt)) / self.num_requests)
+                    exp_t_prefill_prefill = self.estimate_prefill_time(int((1 - pd_balance_factor) * len(original_request.prompt)))
+                    self.sum_t_prefill_prefill += exp_t_prefill_prefill
                     if self.num_running_requests[prefill_server_id] == 0:
                         if self.ts_of_latest_prefill_idle is not None:
                             self.total_prefill_idle_time += time.time() - self.ts_of_latest_prefill_idle
                             self.ts_of_latest_prefill_idle = None
-                
-                self.num_running_requests[prefill_server_id] += 1     
-
-                prefill_start = time.time()      
+                    self.num_running_requests[prefill_server_id] += 1     
 
                 # 1. Ask D to prepare metadata
                 prep_recv_request = microserving_entrypoints.PrepRecvRequest(
@@ -517,13 +398,15 @@ class Router:  # pylint: disable=too-many-instance-attributes
                     )
                 
                 self.num_running_requests[prefill_server_id] -= 1
-                if self.num_running_requests[prefill_server_id] == 0:
-                    self.ts_of_latest_prefill_idle = time.time()
-                
-                prefill_end = time.time()
                 with self.lock:
+                    self.sum_t_prefill_prefill -= exp_t_prefill_prefill
+                    if self.num_running_requests[prefill_server_id] == 0:
+                        self.ts_of_latest_prefill_idle = time.time()
                     self.num_prefills_done += 1
-                    self.total_prefill_duration += prefill_end - prefill_start
+
+                    exp_t_prefill_decode = self.estimate_prefill_time(int(pd_balance_factor * len(original_request.prompt)))
+                    self.sum_t_prefill_decode += exp_t_prefill_decode
+
 
                 # 3. Start decoding, receive and yield back response as a normal request
                 # The kv window passed through denotes the range to prefill on the
@@ -531,11 +414,13 @@ class Router:  # pylint: disable=too-many-instance-attributes
                 
                 # moved from above prep_recv, better reflects decode batch size
                 self.num_running_requests[decode_server_id] += 1
-
+                
                 start_generate_request = microserving_entrypoints.StartGenerateRequest(
                     **original_request.model_dump(),
                     begin=kv_window_end,
                 )
+
+                first_token_out = True
                 async for response in self.send_start_generate(
                     session=session,
                     request=start_generate_request,
@@ -545,13 +430,14 @@ class Router:  # pylint: disable=too-many-instance-attributes
                         finish_reason = response.choices[0].finish_reason
                         if finish_reason == "preempt":
                             yield None
-                    yield response
-            
-                decode_end = time.time()
-                with self.lock:
-                    self.num_decodes_done += 1
-                    self.total_decode_duration += decode_end - prefill_end
 
+                    # a request completes its prefill at the decode phase when it emits its first token
+                    if first_token_out:
+                        with self.lock:
+                            self.sum_t_prefill_decode -= exp_t_prefill_decode
+                        first_token_out = False
+                    yield response
+                
             except Exception as e:
                 self.num_running_requests[decode_server_id] -= 1
                 raise e
