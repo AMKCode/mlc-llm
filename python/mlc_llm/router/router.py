@@ -29,14 +29,12 @@ class OptimizeFor(Enum):
     LATENCY = auto()
     THROUGHPUT = auto()
 
-class OffloadController:
+class RouterProfiler:
     """Controller for the PD offload ratio"""
 
-    def __init__(self, router, optimize_for="latency", period=5):
+    def __init__(self, router, optimize_for="latency", period=3):
         self.router = router
         self.period = period
-        self.min_idle_time = 0.0
-        self.max_idle_time = period * 0.2 # 20% of the time the engine is idle
         self.optimize_for = OptimizeFor.LATENCY if optimize_for == "latency" else OptimizeFor.THROUGHPUT
 
         # thread
@@ -50,37 +48,14 @@ class OffloadController:
                 prefill_server_id = 0
                 self.router.total_prefill_idle_time += (time.time() - self.router.ts_of_latest_prefill_idle) if self.router.ts_of_latest_prefill_idle is not None else 0.0
                 proj_request_rate = self.router.num_requests / self.period
-                proj_prefill_throughput = self.router.num_prefills_done / self.period
-                proj_num_requests = proj_request_rate * self.period
-                proj_t_prefill = self.router.estimate_prefill_time(self.router.avg_request_len)
-                avg_decode_len = 100 # fixed
+                self.router.prefill_throughput = self.router.num_prefills_done / self.period
                 
                 print(f"idle_time: {self.router.total_prefill_idle_time}")
                 print(f"request_rate: {proj_request_rate}")
-                print(f"prefill_throughput: {proj_prefill_throughput}")
+                print(f"prefill_throughput: {self.router.prefill_throughput}")
                 print(f"sum_t_prefill_prefill: {self.router.sum_t_prefill_prefill}")
                 print(f"sum_t_prefill_decode: {self.router.sum_t_prefill_decode}")
-                print(f"num requests in decode {self.router.num_running_requests[1]}")
                 print(f"avg_request_len: {self.router.avg_request_len}")
-                
-                # computation
-                # pd_ratio = (self.router.sum_t_prefill_prefill + \
-                #             (0.5 * proj_t_prefill * (proj_num_requests - 1)) - \
-                #             ((proj_num_requests + 1) / (2 * proj_request_rate + 1e-5)) - \
-                #             self.router.sum_t_prefill_decode + \
-                #             ((proj_num_requests + 1) / (2 * proj_prefill_throughput + 1e-5))) / \
-                #             (proj_t_prefill * (proj_num_requests - 1) + 1e-5)
-                
-                pd_ratio = (self.router.sum_t_prefill_prefill - \
-                            self.router.sum_t_prefill_decode + \
-                            (proj_num_requests * proj_t_prefill) - \
-                            (((self.router.num_running_requests[prefill_server_id] + proj_num_requests - 1) / (proj_prefill_throughput + 1e-5)) + (avg_decode_len * 0.00775))) / \
-                            (2 * proj_t_prefill * proj_num_requests + 1e-5)
-                print(f"calculated pd ratio: {pd_ratio}")
-                self.router.pd_balance_factor = float(np.clip(pd_ratio, 0.0, 1.0))
-            
-                # DELETE THIS LINE
-                # self.router.pd_balance_factor = 0.3
 
                 # zero out the profiling variables
                 # we don't zero out self.avg_request_len because it gets automatically zeroed out when we recieve the first request after the period ends
@@ -88,7 +63,6 @@ class OffloadController:
                 self.router.ts_of_latest_prefill_idle = time.time() if self.router.num_running_requests[prefill_server_id] == 0 else None
                 self.router.num_prefills_done = 0
                 self.router.num_requests = 0
-                print(f"pd_balance_factor: {self.router.pd_balance_factor}")   
 
 class Router:  # pylint: disable=too-many-instance-attributes
     """Programmable Router Implementation"""
@@ -104,7 +78,6 @@ class Router:  # pylint: disable=too-many-instance-attributes
         router_mode: Literal["disagg", "round-robin"] = "disagg",
         pd_balance_factor: float = 0.0,
     ):  # pylint: disable=too-many-arguments,too-many-locals
-        print(f"trying fixed pd {pd_balance_factor}")
         """
         Spawn len(host_list) server endpoints with Popen.
         """
@@ -150,11 +123,14 @@ class Router:  # pylint: disable=too-many-instance-attributes
         self.ts_of_latest_prefill_idle = 0.0
         self.num_requests = 0
         self.avg_request_len = 0
+        self.prefill_throughput = 0.0
 
         # sum of the time for queued prefill in the prefill engine
         self.sum_t_prefill_prefill = 0.0
         # sum of the time for queued prefill in the decode engine
         self.sum_t_prefill_decode = 0.0
+        # number of requests in the decode engine which are decoding
+        self.num_prefill_decode = 0
 
         def start_server(i: int):
             nvshmem_config = {
@@ -195,7 +171,7 @@ class Router:  # pylint: disable=too-many-instance-attributes
 
         # added controller
         self.ts_of_latest_prefill_idle = time.time()
-        self.controller = OffloadController(self)
+        self.controller = RouterProfiler(self)
 
     def estimate_prefill_time(self, request_len: int):
         return (request_len * 0.00005605) + 0.000002299
@@ -336,10 +312,18 @@ class Router:  # pylint: disable=too-many-instance-attributes
         prefill_server_id = 0
         decode_server_id = self._pick_endpoint(range(1, self.num_servers))
 
+        with self.lock:
+            sum_t_decode_decode = ((self.num_running_requests[0] + self.num_prefill_decode - 1) / (self.prefill_throughput + 1e-10)) + (2 * (100 * 0.00775)) # 2, because 1 is for in the formula and the other is for the time it takes for requests currently performing decode, 0.00775 is the time to decode one token, 100 is the number of decoded tokens per request (fixed)
+            pd_ratio = self.sum_t_prefill_prefill / \
+                      (self.sum_t_prefill_decode + sum_t_decode_decode + 1e-10)
+        
+        # comment this out for consistent pd_balance_factor
+        pd_balance_factor = float(np.clip(pd_ratio, 0.0, 1.0))
+
         # Tell D to prepare metadata for prompt[0:kv_window_end].
         # P does not need to sample. Ask D to treat the last
         # token like the first sampled token.
-        # print(f"in_request pd_balance_factor = {pd_balance_factor:.3f}")
+        print(f"pd_balance_factor: {pd_balance_factor:.3f}")
         kv_window_end = (
             -1
             if math.fabs(pd_balance_factor) < 1e-5
@@ -403,9 +387,9 @@ class Router:  # pylint: disable=too-many-instance-attributes
                     if self.num_running_requests[prefill_server_id] == 0:
                         self.ts_of_latest_prefill_idle = time.time()
                     self.num_prefills_done += 1
-
                     exp_t_prefill_decode = self.estimate_prefill_time(int(pd_balance_factor * len(original_request.prompt)))
                     self.sum_t_prefill_decode += exp_t_prefill_decode
+                    self.num_prefill_decode += 1
 
 
                 # 3. Start decoding, receive and yield back response as a normal request
@@ -431,10 +415,11 @@ class Router:  # pylint: disable=too-many-instance-attributes
                         if finish_reason == "preempt":
                             yield None
 
-                    # a request completes its prefill at the decode phase when it emits its first token
+                    # a request completes its prefill at the decode phase when it emits its first token, it now enters the decode phase
                     if first_token_out:
                         with self.lock:
                             self.sum_t_prefill_decode -= exp_t_prefill_decode
+                            self.num_prefill_decode -= 1
                         first_token_out = False
                     yield response
                 
