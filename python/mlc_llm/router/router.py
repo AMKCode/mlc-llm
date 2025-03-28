@@ -32,14 +32,18 @@ class OptimizeFor(Enum):
 class RouterProfiler:
     """Controller for the PD offload ratio"""
 
-    def __init__(self, router, optimize_for="latency", period=3):
+    def __init__(self, router, period=3, momentum=0.3):
         self.router = router
         self.period = period
-        self.optimize_for = OptimizeFor.LATENCY if optimize_for == "latency" else OptimizeFor.THROUGHPUT
+        self.momentum = momentum
 
         # thread
         self._thread = threading.Thread(target=self._step, daemon=True)
         self._thread.start()
+
+        # for smoothing
+        self.prev_prefill_throughput = 0.0
+        self.prev_prefill_throughput_decode = 0.0
     
     def _step(self):
         while True:
@@ -47,12 +51,20 @@ class RouterProfiler:
             with self.router.lock:
                 prefill_server_id = 0
                 self.router.total_prefill_idle_time += (time.time() - self.router.ts_of_latest_prefill_idle) if self.router.ts_of_latest_prefill_idle is not None else 0.0
-                proj_request_rate = self.router.num_requests / self.period
-                self.router.prefill_throughput = self.router.num_prefills_done / self.period
+                request_rate = self.router.num_requests / self.period
+                
+                # smoothed prefill throughput
+                self.router.prefill_throughput = (self.momentum * (self.router.num_prefills_done / self.period)) + ((1 - self.momentum) * self.prev_prefill_throughput)
+                self.prev_prefill_throughput = self.router.prefill_throughput
+
+                # smoothed prefill throughput in decode engine
+                self.router.prefill_throughput_decode = (self.momentum * (self.router.num_prefills_done_decode / self.period)) + ((1 - self.momentum) * self.prev_prefill_throughput_decode)
+                self.prev_prefill_throughput_decode = self.router.prefill_throughput_decode
                 
                 print(f"idle_time: {self.router.total_prefill_idle_time}")
-                print(f"request_rate: {proj_request_rate}")
+                print(f"request_rate: {request_rate}")
                 print(f"prefill_throughput: {self.router.prefill_throughput}")
+                print(f"prefill_throughput_decode: {self.router.prefill_throughput_decode}")
                 print(f"sum_t_prefill_prefill: {self.router.sum_t_prefill_prefill}")
                 print(f"sum_t_prefill_decode: {self.router.sum_t_prefill_decode}")
                 print(f"avg_request_len: {self.router.avg_request_len}")
@@ -62,6 +74,7 @@ class RouterProfiler:
                 self.router.total_prefill_idle_time = 0.0
                 self.router.ts_of_latest_prefill_idle = time.time() if self.router.num_running_requests[prefill_server_id] == 0 else None
                 self.router.num_prefills_done = 0
+                self.router.num_prefills_done_decode = 0
                 self.router.num_requests = 0
 
 class Router:  # pylint: disable=too-many-instance-attributes
@@ -119,11 +132,13 @@ class Router:  # pylint: disable=too-many-instance-attributes
         # profiling variables
         self.lock = threading.Lock()
         self.num_prefills_done = 0
+        self.num_prefills_done_decode = 0
         self.total_prefill_idle_time = 0.0
         self.ts_of_latest_prefill_idle = 0.0
         self.num_requests = 0
         self.avg_request_len = 0
         self.prefill_throughput = 0.0
+        self.prefill_throughput_decode = 0.0
 
         # sum of the time for queued prefill in the prefill engine
         self.sum_t_prefill_prefill = 0.0
@@ -313,9 +328,15 @@ class Router:  # pylint: disable=too-many-instance-attributes
         decode_server_id = self._pick_endpoint(range(1, self.num_servers))
 
         with self.lock:
-            sum_t_decode_decode = ((self.num_running_requests[0] + self.num_prefill_decode - 1) / (self.prefill_throughput + 1e-10)) + (2 * (100 * 0.00775)) # 2, because 1 is for in the formula and the other is for the time it takes for requests currently performing decode, 0.00775 is the time to decode one token, 100 is the number of decoded tokens per request (fixed)
+            # sum of the T(decode) to be performed on requests still in the prefill engine
+            sum_t_decode_prefill = ((self.num_running_requests[0] - 1) / (self.prefill_throughput + 1e-10)) + (100 * 0.00775)
+            # sum of the T(decode) to be performed on requests doing prefill in the decode engine
+            sum_t_decode_decode = ((self.num_prefill_decode - 1) / (self.prefill_throughput_decode + 1e-10)) + (100 * 0.00775)
+
             pd_ratio = self.sum_t_prefill_prefill / \
-                      (self.sum_t_prefill_decode + sum_t_decode_decode + 1e-10)
+                      (self.sum_t_prefill_decode + \
+                       sum_t_decode_prefill + \
+                       sum_t_decode_decode  + (100 * 0.00775) + 1e-10)
         
         # comment this out for consistent pd_balance_factor
         pd_balance_factor = float(np.clip(pd_ratio, 0.0, 1.0))
@@ -419,6 +440,7 @@ class Router:  # pylint: disable=too-many-instance-attributes
                     if first_token_out:
                         with self.lock:
                             self.sum_t_prefill_decode -= exp_t_prefill_decode
+                            self.num_prefills_done_decode += 1
                             self.num_prefill_decode -= 1
                         first_token_out = False
                     yield response
