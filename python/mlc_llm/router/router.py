@@ -32,7 +32,7 @@ class OptimizeFor(Enum):
 class RouterProfiler:
     """Controller for the PD offload ratio"""
 
-    def __init__(self, router, period=3, momentum=0.3):
+    def __init__(self, router, period=1, momentum=0.3):
         self.router = router
         self.period = period
         self.momentum = momentum
@@ -44,30 +44,50 @@ class RouterProfiler:
         # for smoothing
         self.prev_prefill_throughput = 0.0
         self.prev_prefill_throughput_decode = 0.0
+        self.prev_workload_ratio = 0.0
     
     def _step(self):
         while True:
             time.sleep(self.period)
             with self.router.lock:
                 prefill_server_id = 0
-                self.router.total_prefill_idle_time += (time.time() - self.router.ts_of_latest_prefill_idle) if self.router.ts_of_latest_prefill_idle is not None else 0.0
-                request_rate = self.router.num_requests / self.period
+                # self.router.total_prefill_idle_time += (time.time() - self.router.ts_of_latest_prefill_idle) if self.router.ts_of_latest_prefill_idle is not None else 0.0
+                # request_rate = self.router.num_requests / self.period
                 
                 # smoothed prefill throughput
-                self.router.prefill_throughput = (self.momentum * (self.router.num_prefills_done / self.period)) + ((1 - self.momentum) * self.prev_prefill_throughput)
-                self.prev_prefill_throughput = self.router.prefill_throughput
+                # self.router.prefill_throughput = (self.momentum * (self.router.num_prefills_done / self.period)) + ((1 - self.momentum) * self.prev_prefill_throughput)
+                # self.prev_prefill_throughput = self.router.prefill_throughput
+                self.router.prefill_throughput = self.router.num_prefills_done / self.period
 
                 # smoothed prefill throughput in decode engine
-                self.router.prefill_throughput_decode = (self.momentum * (self.router.num_prefills_done_decode / self.period)) + ((1 - self.momentum) * self.prev_prefill_throughput_decode)
-                self.prev_prefill_throughput_decode = self.router.prefill_throughput_decode
+                # self.router.prefill_throughput_decode = (self.momentum * (self.router.num_prefills_done_decode / self.period)) + ((1 - self.momentum) * self.prev_prefill_throughput_decode)
+                # self.prev_prefill_throughput_decode = self.router.prefill_throughput_decode
+                self.router.prefill_throughput_decode = self.router.num_prefills_done_decode / self.period
+
+                # sum of the T(decode) to be performed on requests still in the prefill engine
+                sum_t_decode_prefill = ((self.router.num_running_requests[prefill_server_id] - 1) / (self.router.prefill_throughput + 1e-10)) + (100 * 0.00775)
+                # sum of the T(decode) to be performed on requests doing prefill in the decode engine
+                sum_t_decode_decode = ((self.router.num_prefill_decode - 1) / (self.router.prefill_throughput_decode + 1e-10)) + (100 * 0.00775)
+
+                # ratio of amount of work in prefill to the amount of work in decode
+                workload_ratio = self.router.sum_t_prefill_prefill / \
+                        (self.router.sum_t_prefill_decode + \
+                        sum_t_decode_prefill + \
+                        sum_t_decode_decode  + (100 * 0.00775) + 1e-10)
+                # self.router.workload_ratio = (self.momentum * workload_ratio) + ((1 - self.momentum) * self.prev_workload_ratio)
+                # self.prev_workload_ratio = self.router.workload_ratio
+                self.router.workload_ratio = workload_ratio
                 
-                print(f"idle_time: {self.router.total_prefill_idle_time}")
-                print(f"request_rate: {request_rate}")
+                # print(f"idle_time: {self.router.total_prefill_idle_time}")
+                # print(f"request_rate: {request_rate}")
                 print(f"prefill_throughput: {self.router.prefill_throughput}")
                 print(f"prefill_throughput_decode: {self.router.prefill_throughput_decode}")
-                print(f"sum_t_prefill_prefill: {self.router.sum_t_prefill_prefill}")
-                print(f"sum_t_prefill_decode: {self.router.sum_t_prefill_decode}")
-                print(f"avg_request_len: {self.router.avg_request_len}")
+                # print(f"sum_t_prefill_prefill: {self.router.sum_t_prefill_prefill}")
+                # print(f"sum_t_prefill_decode: {self.router.sum_t_prefill_decode}")
+                # print(f"avg_request_len: {self.router.avg_request_len}")
+                print(f"num_running_requests[0]: {self.router.num_running_requests[0]}")
+                print(f"num_prefill_decode: {self.router.num_prefill_decode}")
+                print(f"workload_ratio: {self.router.workload_ratio}")
 
                 # zero out the profiling variables
                 # we don't zero out self.avg_request_len because it gets automatically zeroed out when we recieve the first request after the period ends
@@ -139,13 +159,16 @@ class Router:  # pylint: disable=too-many-instance-attributes
         self.avg_request_len = 0
         self.prefill_throughput = 0.0
         self.prefill_throughput_decode = 0.0
+        self.latest_pd_factor = 0.0
 
         # sum of the time for queued prefill in the prefill engine
         self.sum_t_prefill_prefill = 0.0
         # sum of the time for queued prefill in the decode engine
         self.sum_t_prefill_decode = 0.0
-        # number of requests in the decode engine which are decoding
+        # number of requests in the decode engine which are prefilling
         self.num_prefill_decode = 0
+
+        self.workload_ratio = 0.0
 
         def start_server(i: int):
             nvshmem_config = {
@@ -327,19 +350,22 @@ class Router:  # pylint: disable=too-many-instance-attributes
         prefill_server_id = 0
         decode_server_id = self._pick_endpoint(range(1, self.num_servers))
 
-        with self.lock:
-            # sum of the T(decode) to be performed on requests still in the prefill engine
-            sum_t_decode_prefill = ((self.num_running_requests[0] - 1) / (self.prefill_throughput + 1e-10)) + (100 * 0.00775)
-            # sum of the T(decode) to be performed on requests doing prefill in the decode engine
-            sum_t_decode_decode = ((self.num_prefill_decode - 1) / (self.prefill_throughput_decode + 1e-10)) + (100 * 0.00775)
+        # with self.lock:
+        #     # sum of the T(decode) to be performed on requests still in the prefill engine
+        #     sum_t_decode_prefill = ((self.num_running_requests[prefill_server_id] - 1) / (self.prefill_throughput + 1e-10)) + (100 * 0.00775)
+        #     # sum of the T(decode) to be performed on requests doing prefill in the decode engine
+        #     sum_t_decode_decode = ((self.num_prefill_decode - 1) / (self.prefill_throughput_decode + 1e-10)) + (100 * 0.00775)
 
-            pd_ratio = self.sum_t_prefill_prefill / \
-                      (self.sum_t_prefill_decode + \
-                       sum_t_decode_prefill + \
-                       sum_t_decode_decode  + (100 * 0.00775) + 1e-10)
+        #     # ratio of amount of work in prefill to the amount of work in decode
+        #     workload_ratio = self.sum_t_prefill_prefill / \
+        #               (self.sum_t_prefill_decode + \
+        #                sum_t_decode_prefill + \
+        #                sum_t_decode_decode  + (100 * 0.00775) + 1e-10)
         
         # comment this out for consistent pd_balance_factor
-        pd_balance_factor = float(np.clip(pd_ratio, 0.0, 1.0))
+        # pd_balance_factor = float(np.clip(workload_ratio, 0.0, 1.0))
+        pd_balance_factor = float(np.clip(self.workload_ratio, 0.0, 1.0))
+        self.latest_pd_factor = pd_balance_factor
 
         # Tell D to prepare metadata for prompt[0:kv_window_end].
         # P does not need to sample. Ask D to treat the last
