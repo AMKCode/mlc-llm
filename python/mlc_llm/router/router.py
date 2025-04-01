@@ -64,16 +64,18 @@ class RouterProfiler:
                 # self.prev_prefill_throughput_decode = self.router.prefill_throughput_decode
                 self.router.prefill_throughput_decode = self.router.num_prefills_done_decode / self.period
 
-                # sum of the T(decode) to be performed on requests still in the prefill engine
-                sum_t_decode_prefill = ((self.router.num_running_requests[prefill_server_id] - 1) / (self.router.prefill_throughput + 1e-10)) + (100 * 0.00775)
-                # sum of the T(decode) to be performed on requests doing prefill in the decode engine
-                sum_t_decode_decode = ((self.router.num_prefill_decode - 1) / (self.router.prefill_throughput_decode + 1e-10)) + (100 * 0.00775)
+                # # sum of the T(decode) to be performed on requests still in the prefill engine
+                # sum_t_decode_prefill = ((self.router.num_running_requests[prefill_server_id] - 1) / (self.router.prefill_throughput + 1e-10)) + (100 * 0.00775)
+                # # sum of the T(decode) to be performed on requests doing prefill in the decode engine
+                # sum_t_decode_decode = ((self.router.num_prefill_decode - 1) / (self.router.prefill_throughput_decode + 1e-10)) + (100 * 0.00775)
+
+                # we take the min() because the overall throughput/rate is the minimum of two engines connected in series
+                sum_t_decode = ((self.router.num_running_requests[prefill_server_id] + self.router.num_prefill_decode - 1) / (min(self.router.prefill_throughput_decode, self.router.prefill_throughput) + 1e-10)) + (100 * 0.00775)
 
                 # ratio of amount of work in prefill to the amount of work in decode
                 workload_ratio = self.router.sum_t_prefill_prefill / \
                         (self.router.sum_t_prefill_decode + \
-                        sum_t_decode_prefill + \
-                        sum_t_decode_decode  + (100 * 0.00775) + 1e-10)
+                        sum_t_decode + 1e-10)
                 # self.router.workload_ratio = (self.momentum * workload_ratio) + ((1 - self.momentum) * self.prev_workload_ratio)
                 # self.prev_workload_ratio = self.router.workload_ratio
                 self.router.workload_ratio = workload_ratio
