@@ -41,10 +41,16 @@ class RouterProfiler:
         self._thread = threading.Thread(target=self._step, daemon=True)
         self._thread.start()
 
+        # tpot
+        self.prev_tpot = 0.0
+
         # for smoothing
         self.prev_prefill_throughput = 0.0
         self.prev_prefill_throughput_decode = 0.0
         self.prev_workload_ratio = 0.0
+    
+    def get_TPOT(self, batch_size):
+        return (batch_size * 0.00014956) + 0.010226
     
     def _step(self):
         while True:
@@ -69,8 +75,25 @@ class RouterProfiler:
             # # sum of the T(decode) to be performed on requests doing prefill in the decode engine
             # sum_t_decode_decode = ((self.router.num_prefill_decode - 1) / (self.router.prefill_throughput_decode + 1e-10)) + (100 * 0.00775)
 
+            # N
+            num_prefilling_requests = self.router.num_running_requests[prefill_server_id] + self.router.num_prefill_decode
+
+            # R
             # we take the min() because the overall throughput/rate is the minimum of two engines connected in series
-            sum_t_decode = ((self.router.num_running_requests[prefill_server_id] + self.router.num_prefill_decode - 1) / (min(self.router.prefill_throughput_decode, self.router.prefill_throughput) + 1e-10)) + (100 * 0.00775)
+            throughput = min(self.router.prefill_throughput_decode, self.router.prefill_throughput) * self.prev_tpot
+
+            # T
+            avg_num_decode_tokens = 100
+
+            total_work = num_prefilling_requests * avg_num_decode_tokens
+            execution_time = ((num_prefilling_requests - 1) / (throughput + 1e-10)) + avg_num_decode_tokens
+
+            avg_batch_size = total_work / (execution_time + 1e-10)
+
+            tpot = self.get_TPOT(avg_batch_size)
+            self.prev_tpot = tpot
+
+            sum_t_decode = tpot * execution_time
 
             # ratio of amount of work in prefill to the amount of work in decode
             workload_ratio = self.router.sum_t_prefill_prefill / \
@@ -87,6 +110,8 @@ class RouterProfiler:
             # print(f"sum_t_prefill_prefill: {self.router.sum_t_prefill_prefill}")
             # print(f"sum_t_prefill_decode: {self.router.sum_t_prefill_decode}")
             # print(f"avg_request_len: {self.router.avg_request_len}")
+            print(f"avg_batch_size: {avg_batch_size}")
+            print(f"sum_t_decode: {sum_t_decode}")
             print(f"num_running_requests[0]: {self.router.num_running_requests[0]}")
             print(f"num_prefill_decode: {self.router.num_prefill_decode}")
             print(f"workload_ratio: {self.router.workload_ratio}")
