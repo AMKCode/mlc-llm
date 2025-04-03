@@ -41,9 +41,6 @@ class RouterProfiler:
         self._thread = threading.Thread(target=self._step, daemon=True)
         self._thread.start()
 
-        # tpot
-        self.prev_tpot = 0.0
-
         # for smoothing
         self.prev_prefill_throughput = 0.0
         self.prev_prefill_throughput_decode = 0.0
@@ -80,25 +77,22 @@ class RouterProfiler:
 
             # R
             # we take the min() because the overall throughput/rate is the minimum of two engines connected in series
-            throughput = min(self.router.prefill_throughput_decode, self.router.prefill_throughput) * self.prev_tpot
+            throughput = min(self.router.prefill_throughput_decode, self.router.prefill_throughput)
 
             # T
             avg_num_decode_tokens = 100
 
-            total_work = num_prefilling_requests * avg_num_decode_tokens
-            execution_time = ((num_prefilling_requests - 1) / (throughput + 1e-10)) + avg_num_decode_tokens
-
-            avg_batch_size = total_work / (execution_time + 1e-10)
+            
+            avg_batch_size = self.router.num_running_requests[1] - self.router.num_prefill_decode
 
             tpot = self.get_TPOT(avg_batch_size)
-            self.prev_tpot = tpot
 
-            sum_t_decode = tpot * execution_time
+            sum_t_decode = ((num_prefilling_requests - 1) / (throughput + 1e-10)) + (avg_num_decode_tokens * tpot)
 
             # ratio of amount of work in prefill to the amount of work in decode
             workload_ratio = self.router.sum_t_prefill_prefill / \
                     (self.router.sum_t_prefill_decode + \
-                    sum_t_decode + 1e-10)
+                    sum_t_decode)
             # self.router.workload_ratio = (self.momentum * workload_ratio) + ((1 - self.momentum) * self.prev_workload_ratio)
             # self.prev_workload_ratio = self.router.workload_ratio
             self.router.workload_ratio = workload_ratio
@@ -107,8 +101,8 @@ class RouterProfiler:
             # print(f"request_rate: {request_rate}")
             print(f"prefill_throughput: {self.router.prefill_throughput}")
             print(f"prefill_throughput_decode: {self.router.prefill_throughput_decode}")
-            # print(f"sum_t_prefill_prefill: {self.router.sum_t_prefill_prefill}")
-            # print(f"sum_t_prefill_decode: {self.router.sum_t_prefill_decode}")
+            print(f"sum_t_prefill_prefill: {self.router.sum_t_prefill_prefill}")
+            print(f"sum_t_prefill_decode: {self.router.sum_t_prefill_decode}")
             # print(f"avg_request_len: {self.router.avg_request_len}")
             print(f"avg_batch_size: {avg_batch_size}")
             print(f"sum_t_decode: {sum_t_decode}")
@@ -406,13 +400,10 @@ class Router:  # pylint: disable=too-many-instance-attributes
             try:
                 self.num_requests += 1
                 self.avg_request_len = int(((self.num_requests - 1) * self.avg_request_len + len(original_request.prompt)) / self.num_requests)
-                exp_t_prefill_prefill = self.estimate_prefill_time(int((1 - pd_balance_factor) * len(original_request.prompt)))
-                self.sum_t_prefill_prefill += exp_t_prefill_prefill
                 if self.num_running_requests[prefill_server_id] == 0:
                     if self.ts_of_latest_prefill_idle is not None:
                         self.total_prefill_idle_time += time.time() - self.ts_of_latest_prefill_idle
                         self.ts_of_latest_prefill_idle = None
-                self.num_running_requests[prefill_server_id] += 1     
 
                 # 1. Ask D to prepare metadata
                 prep_recv_request = microserving_entrypoints.PrepRecvRequest(
@@ -433,6 +424,10 @@ class Router:  # pylint: disable=too-many-instance-attributes
                     else kv_window_end
                 )
                 assert prefix_matched_length <= kv_window_end
+
+                self.num_running_requests[prefill_server_id] += 1  
+                exp_t_prefill_prefill = self.estimate_prefill_time(int((1 - pd_balance_factor) * len(original_request.prompt)))
+                self.sum_t_prefill_prefill += exp_t_prefill_prefill   
 
                 # 2. Send P the prefill request and D's metadata. When it returns, it means that
                 # KV transfer has finished prefilling and transferring the KV of

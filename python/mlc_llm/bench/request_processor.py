@@ -690,7 +690,7 @@ def create_pipelines(
         
         return [
             SequentialProcessor(
-                LogMessage(f"Running fluctuating request rates for {args.duration} minutes, with a peak request rate of {args.peak_request_rate} minutes"),
+                LogMessage(f"Running fluctuating request rates for {args.duration} minutes, with a peak request rate of {args.peak_request_rate} reqs/s"),
                 SampleRequests(num_samples),
                 AttachModelName(args.tokenizer),
                 AttachFluctuatingRateTimestamp(args.peak_request_rate, args.duration),
