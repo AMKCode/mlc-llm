@@ -32,19 +32,13 @@ class OptimizeFor(Enum):
 class RouterProfiler:
     """Controller for the PD offload ratio"""
 
-    def __init__(self, router, period=1, momentum=0.3):
+    def __init__(self, router, period=0.25):
         self.router = router
         self.period = period
-        self.momentum = momentum
 
         # thread
         self._thread = threading.Thread(target=self._step, daemon=True)
         self._thread.start()
-
-        # for smoothing
-        self.prev_prefill_throughput = 0.0
-        self.prev_prefill_throughput_decode = 0.0
-        self.prev_workload_ratio = 0.0
     
     def get_TPOT(self, batch_size):
         return (batch_size * 0.00014956) + 0.010226
@@ -81,7 +75,6 @@ class RouterProfiler:
 
             # T
             avg_num_decode_tokens = 100
-
             
             avg_batch_size = self.router.num_running_requests[1] - self.router.num_prefill_decode
 
@@ -99,21 +92,21 @@ class RouterProfiler:
             
             # print(f"idle_time: {self.router.total_prefill_idle_time}")
             # print(f"request_rate: {request_rate}")
-            print(f"prefill_throughput: {self.router.prefill_throughput}")
-            print(f"prefill_throughput_decode: {self.router.prefill_throughput_decode}")
-            print(f"sum_t_prefill_prefill: {self.router.sum_t_prefill_prefill}")
-            print(f"sum_t_prefill_decode: {self.router.sum_t_prefill_decode}")
+            # print(f"prefill_throughput: {self.router.prefill_throughput}")
+            # print(f"prefill_throughput_decode: {self.router.prefill_throughput_decode}")
+            # print(f"sum_t_prefill_prefill: {self.router.sum_t_prefill_prefill}")
+            # print(f"sum_t_prefill_decode: {self.router.sum_t_prefill_decode}")
             # print(f"avg_request_len: {self.router.avg_request_len}")
-            print(f"avg_batch_size: {avg_batch_size}")
-            print(f"sum_t_decode: {sum_t_decode}")
-            print(f"num_running_requests[0]: {self.router.num_running_requests[0]}")
-            print(f"num_prefill_decode: {self.router.num_prefill_decode}")
-            print(f"workload_ratio: {self.router.workload_ratio}")
+            # print(f"avg_batch_size: {avg_batch_size}")
+            # print(f"sum_t_decode: {sum_t_decode}")
+            # print(f"num_running_requests[0]: {self.router.num_running_requests[0]}")
+            # print(f"num_prefill_decode: {self.router.num_prefill_decode}")
+            # print(f"workload_ratio: {self.router.workload_ratio}")
 
             # zero out the profiling variables
             # we don't zero out self.avg_request_len because it gets automatically zeroed out when we recieve the first request after the period ends
-            self.router.total_prefill_idle_time = 0.0
-            self.router.ts_of_latest_prefill_idle = time.time() if self.router.num_running_requests[prefill_server_id] == 0 else None
+            # self.router.total_prefill_idle_time = 0.0
+            # self.router.ts_of_latest_prefill_idle = time.time() if self.router.num_running_requests[prefill_server_id] == 0 else None
             self.router.num_prefills_done = 0
             self.router.num_prefills_done_decode = 0
             self.router.num_requests = 0
@@ -173,8 +166,8 @@ class Router:  # pylint: disable=too-many-instance-attributes
         # profiling variables
         self.num_prefills_done = 0
         self.num_prefills_done_decode = 0
-        self.total_prefill_idle_time = 0.0
-        self.ts_of_latest_prefill_idle = 0.0
+        # self.total_prefill_idle_time = 0.0
+        # self.ts_of_latest_prefill_idle = 0.0
         self.num_requests = 0
         self.avg_request_len = 0
         self.prefill_throughput = 0.0
@@ -227,7 +220,7 @@ class Router:  # pylint: disable=too-many-instance-attributes
         self.tokenizer = Tokenizer(model)
 
         # added controller
-        self.ts_of_latest_prefill_idle = time.time()
+        # self.ts_of_latest_prefill_idle = time.time()
         self.controller = RouterProfiler(self)
 
     def estimate_prefill_time(self, request_len: int):
@@ -400,10 +393,10 @@ class Router:  # pylint: disable=too-many-instance-attributes
             try:
                 self.num_requests += 1
                 self.avg_request_len = int(((self.num_requests - 1) * self.avg_request_len + len(original_request.prompt)) / self.num_requests)
-                if self.num_running_requests[prefill_server_id] == 0:
-                    if self.ts_of_latest_prefill_idle is not None:
-                        self.total_prefill_idle_time += time.time() - self.ts_of_latest_prefill_idle
-                        self.ts_of_latest_prefill_idle = None
+                # if self.num_running_requests[prefill_server_id] == 0:
+                #     if self.ts_of_latest_prefill_idle is not None:
+                #         self.total_prefill_idle_time += time.time() - self.ts_of_latest_prefill_idle
+                #         self.ts_of_latest_prefill_idle = None
 
                 # 1. Ask D to prepare metadata
                 prep_recv_request = microserving_entrypoints.PrepRecvRequest(
@@ -448,8 +441,8 @@ class Router:  # pylint: disable=too-many-instance-attributes
                 
                 self.num_running_requests[prefill_server_id] -= 1
                 self.sum_t_prefill_prefill -= exp_t_prefill_prefill
-                if self.num_running_requests[prefill_server_id] == 0:
-                    self.ts_of_latest_prefill_idle = time.time()
+                # if self.num_running_requests[prefill_server_id] == 0:
+                #     self.ts_of_latest_prefill_idle = time.time()
                 self.num_prefills_done += 1
                 exp_t_prefill_decode = self.estimate_prefill_time(int(pd_balance_factor * len(original_request.prompt)))
                 self.sum_t_prefill_decode += exp_t_prefill_decode
