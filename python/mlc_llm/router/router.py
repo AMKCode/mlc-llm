@@ -32,9 +32,11 @@ class OptimizeFor(Enum):
 class RouterProfiler:
     """Controller for the PD offload ratio"""
 
-    def __init__(self, router, period=0.25):
+    def __init__(self, router, period=0.25, debug_mode=True):
         self.router = router
         self.period = period
+        self.debug_mode = debug_mode
+        self.ctr = 0
 
         # thread
         self._thread = threading.Thread(target=self._step, daemon=True)
@@ -71,6 +73,21 @@ class RouterProfiler:
             self.router.workload_ratio = self.router.sum_t_prefill_prefill / \
                     (self.router.sum_t_prefill_decode + \
                     sum_t_decode)
+            
+            # DELETE THIS
+            self.router.workload_ratio = 0.4
+
+            # print statements
+            if self.debug_mode and ((self.ctr % 10) == 0):
+                print(f"prefill: {self.router.num_running_requests[prefill_server_id]}")
+                print(f"decode: {self.router.num_running_requests[decode_server_id]}")
+                print(f"throughput: {throughput}")
+                print(f"num_prefill_decode: {self.router.num_prefill_decode}")
+                print(f"sum_t_decode: {sum_t_decode}")
+                print(f"sum_t_prefill_prefill: {self.router.sum_t_prefill_prefill}")
+                print(f"sum_t_prefill_decode: {self.router.sum_t_prefill_decode}")
+                print(f"workload_ratio: {self.router.workload_ratio}")
+            self.ctr += 1
             
             # zero out the profiling variables
             self.router.num_prefills_done = 0
@@ -340,6 +357,11 @@ class Router:  # pylint: disable=too-many-instance-attributes
             try:
                 self.num_requests += 1
                 self.avg_request_len = int(((self.num_requests - 1) * self.avg_request_len + len(original_request.prompt)) / self.num_requests)
+                self.num_running_requests[prefill_server_id] += 1  
+                exp_t_prefill_prefill = self.estimate_prefill_time(int((1 - pd_balance_factor) * len(original_request.prompt)))
+                self.sum_t_prefill_prefill += exp_t_prefill_prefill   
+                exp_t_prefill_decode = self.estimate_prefill_time(int(pd_balance_factor * len(original_request.prompt)))
+                self.sum_t_prefill_decode += exp_t_prefill_decode
 
                 # 1. Ask D to prepare metadata
                 prep_recv_request = microserving_entrypoints.PrepRecvRequest(
@@ -361,10 +383,6 @@ class Router:  # pylint: disable=too-many-instance-attributes
                 )
                 assert prefix_matched_length <= kv_window_end
 
-                self.num_running_requests[prefill_server_id] += 1  
-                exp_t_prefill_prefill = self.estimate_prefill_time(int((1 - pd_balance_factor) * len(original_request.prompt)))
-                self.sum_t_prefill_prefill += exp_t_prefill_prefill   
-
                 # 2. Send P the prefill request and D's metadata. When it returns, it means that
                 # KV transfer has finished prefilling and transferring the KV of
                 # prompt[prefix_matched_length:kv_window_end]. So D is ready to decode.
@@ -385,8 +403,6 @@ class Router:  # pylint: disable=too-many-instance-attributes
                 self.num_running_requests[prefill_server_id] -= 1
                 self.sum_t_prefill_prefill -= exp_t_prefill_prefill
                 self.num_prefills_done += 1
-                exp_t_prefill_decode = self.estimate_prefill_time(int(pd_balance_factor * len(original_request.prompt)))
-                self.sum_t_prefill_decode += exp_t_prefill_decode
                 self.num_prefill_decode += 1
 
 
