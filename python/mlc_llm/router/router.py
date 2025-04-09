@@ -18,17 +18,6 @@ from mlc_llm.tokenizers import Tokenizer
 
 import time
 
-class RatioAction(Enum):
-    NO_ACTION = auto()
-    TO_INCREASE = auto()
-    INCREASE = auto()
-    TO_DECREASE = auto()
-    DECREASE = auto()
-
-class OptimizeFor(Enum):
-    LATENCY = auto()
-    THROUGHPUT = auto()
-
 class RouterProfiler:
     """Controller for the PD offload ratio"""
 
@@ -37,6 +26,9 @@ class RouterProfiler:
         self.period = period
         self.debug_mode = debug_mode
         self.ctr = 0
+
+        self.throughput = 0.0
+        self.sum_t_decode = 0.0
 
         # thread
         self._thread = threading.Thread(target=self._step, daemon=True)
@@ -59,31 +51,32 @@ class RouterProfiler:
             num_prefilling_requests = self.router.num_running_requests[prefill_server_id] + self.router.num_prefill_decode
 
             # we take the min() because the overall throughput/rate is the minimum of two engines connected in series
-            throughput = min(prefill_throughput_decode, prefill_throughput)
-
-            avg_num_decode_tokens = 100
+            tpt = min(prefill_throughput_decode, prefill_throughput)
+            if tpt > 0:
+                self.throughput = tpt
             
             avg_batch_size = self.router.num_running_requests[decode_server_id] - self.router.num_prefill_decode
 
             tpot = self.get_TPOT(avg_batch_size)
 
-            sum_t_decode = ((num_prefilling_requests - 1) / (throughput + 1e-10)) + (avg_num_decode_tokens * tpot)
+            if num_prefilling_requests != 0 and self.throughput > 0:
+                self.sum_t_decode = ((num_prefilling_requests - 1) / self.throughput) + (self.router.avg_num_decode_tokens * tpot)
 
             # ratio of amount of work in prefill to the amount of work in decode
             self.router.workload_ratio = self.router.sum_t_prefill_prefill / \
                     (self.router.sum_t_prefill_decode + \
-                    sum_t_decode)
+                    self.sum_t_decode + 1e-10)
             
             # DELETE THIS
-            self.router.workload_ratio = 0.4
+            # self.router.workload_ratio -= 0.05
 
             # print statements
             if self.debug_mode and ((self.ctr % 10) == 0):
                 print(f"prefill: {self.router.num_running_requests[prefill_server_id]}")
                 print(f"decode: {self.router.num_running_requests[decode_server_id]}")
-                print(f"throughput: {throughput}")
+                print(f"throughput: {self.throughput}")
                 print(f"num_prefill_decode: {self.router.num_prefill_decode}")
-                print(f"sum_t_decode: {sum_t_decode}")
+                print(f"sum_t_decode: {self.sum_t_decode}")
                 print(f"sum_t_prefill_prefill: {self.router.sum_t_prefill_prefill}")
                 print(f"sum_t_prefill_decode: {self.router.sum_t_prefill_decode}")
                 print(f"workload_ratio: {self.router.workload_ratio}")
@@ -92,7 +85,6 @@ class RouterProfiler:
             # zero out the profiling variables
             self.router.num_prefills_done = 0
             self.router.num_prefills_done_decode = 0
-            self.router.num_requests = 0
 
 class Router:  # pylint: disable=too-many-instance-attributes
     """Programmable Router Implementation"""
@@ -151,6 +143,7 @@ class Router:  # pylint: disable=too-many-instance-attributes
         self.num_prefills_done_decode = 0
         self.num_requests = 0
         self.avg_request_len = 0
+        self.avg_num_decode_tokens = 300
 
         # sum of the time for queued prefill in the prefill engine
         self.sum_t_prefill_prefill = 0.0
@@ -345,7 +338,7 @@ class Router:  # pylint: disable=too-many-instance-attributes
         # Tell D to prepare metadata for prompt[0:kv_window_end].
         # P does not need to sample. Ask D to treat the last
         # token like the first sampled token.
-        print(f"pd_balance_factor: {pd_balance_factor:.3f}")
+        # print(f"pd_balance_factor: {pd_balance_factor:.3f}")
         kv_window_end = (
             -1
             if math.fabs(pd_balance_factor) < 1e-5
@@ -405,7 +398,6 @@ class Router:  # pylint: disable=too-many-instance-attributes
                 self.num_prefills_done += 1
                 self.num_prefill_decode += 1
 
-
                 # 3. Start decoding, receive and yield back response as a normal request
                 # The kv window passed through denotes the range to prefill on the
                 # decode server, which should be [-1:] here.
@@ -419,6 +411,7 @@ class Router:  # pylint: disable=too-many-instance-attributes
                 )
 
                 first_token_out = True
+                num_decode_tokens = 0
                 async for response in self.send_start_generate(
                     session=session,
                     request=start_generate_request,
@@ -435,8 +428,11 @@ class Router:  # pylint: disable=too-many-instance-attributes
                         self.num_prefills_done_decode += 1
                         self.num_prefill_decode -= 1
                         first_token_out = False
+                    
+                    num_decode_tokens += 1
                     yield response
                 
+                self.avg_num_decode_tokens = int(((self.num_requests - 1) * self.avg_num_decode_tokens + num_decode_tokens) / self.num_requests)
             except Exception as e:
                 self.num_running_requests[decode_server_id] -= 1
                 raise e
