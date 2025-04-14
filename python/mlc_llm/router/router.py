@@ -28,8 +28,8 @@ class RouterProfiler:
         self.ctr = 0
 
         self.throughput = 0.0
-        self.sum_t_decode = 0.0
         self.workload_ratio = 0.0
+        self.est_t_decode = 0.0
 
         # thread
         self._thread = threading.Thread(target=self._step, daemon=True)
@@ -55,24 +55,18 @@ class RouterProfiler:
                 self.router.num_prefills_done = 0
                 self.router.num_prefills_done_decode = 0
             
-            avg_batch_size = self.router.num_running_requests[decode_server_id] - self.router.num_prefill_decode
-
-            tpot = self.router.get_TPOT(avg_batch_size)
-
             if num_prefilling_requests > 0 and self.throughput > 0:
-                self.sum_t_decode = ((num_prefilling_requests - 1) / self.throughput) + (self.router.avg_num_decode_tokens * tpot)
+                avg_batch_size = self.router.num_running_requests[decode_server_id] - self.router.num_prefill_decode
+                tpot = self.router.get_TPOT(avg_batch_size)
+
+                sum_t_decode = ((num_prefilling_requests - 1) / self.throughput) + (self.router.avg_num_decode_tokens * tpot)
 
                 # ratio of amount of work in prefill to the amount of work in decode
                 self.workload_ratio = self.router.sum_t_prefill_prefill / \
                         (self.router.sum_t_prefill_decode + \
-                        self.sum_t_decode)
+                        sum_t_decode)
             
-                est_t_prefill = self.router.estimate_prefill_time(self.router.avg_request_len)
-                est_t_decode = max(tpot, 1.0 / self.throughput)
-                self.router.pd_ratio = (((est_t_prefill + est_t_decode) * self.workload_ratio) - est_t_decode) / est_t_prefill
-            
-            # DELETE THIS
-            # self.router.pd_ratio = 0.4
+                self.est_t_decode = max(tpot, 1.0 / self.throughput)
 
             # print statements
             if self.debug_mode and ((self.ctr % 10) == 0):
@@ -80,11 +74,8 @@ class RouterProfiler:
                 print(f"decode: {self.router.num_running_requests[decode_server_id]}")
                 print(f"throughput: {self.throughput}")
                 print(f"num_prefill_decode: {self.router.num_prefill_decode}")
-                print(f"sum_t_decode: {self.sum_t_decode}")
-                print(f"avg_batch_size: {avg_batch_size}")
                 print(f"sum_t_prefill_prefill: {self.router.sum_t_prefill_prefill}")
                 print(f"sum_t_prefill_decode: {self.router.sum_t_prefill_decode}")
-                print(f"pd_ratio: {self.router.pd_ratio}")
                 print(f"workload_ratio: {self.workload_ratio}")
             self.ctr += 1
         
@@ -145,7 +136,6 @@ class Router:  # pylint: disable=too-many-instance-attributes
         self.num_prefills_done = 0
         self.num_prefills_done_decode = 0
         self.num_requests = 0
-        self.avg_request_len = 3000
         self.avg_num_decode_tokens = 100
 
         # sum of the time for queued prefill in the prefill engine
@@ -154,8 +144,6 @@ class Router:  # pylint: disable=too-many-instance-attributes
         self.sum_t_prefill_decode = 0.0
         # number of requests in the decode engine which are prefilling
         self.num_prefill_decode = 0
-
-        self.pd_ratio = 0.0
 
         def start_server(i: int):
             nvshmem_config = {
@@ -339,7 +327,10 @@ class Router:  # pylint: disable=too-many-instance-attributes
         prefill_server_id = 0
         decode_server_id = self._pick_endpoint(range(1, self.num_servers))
 
-        pd_balance_factor = float(np.clip(self.pd_ratio, 0.0, 1.0))
+        est_t_prefill = self.estimate_prefill_time(len(original_request.prompt))
+        pd_ratio = (((est_t_prefill + self.controller.est_t_decode) * self.controller.workload_ratio) - self.controller.est_t_decode) / est_t_prefill
+
+        pd_balance_factor = float(np.clip(pd_ratio, 0.0, 1.0))
 
         # Tell D to prepare metadata for prompt[0:kv_window_end].
         # P does not need to sample. Ask D to treat the last
@@ -355,7 +346,6 @@ class Router:  # pylint: disable=too-many-instance-attributes
         ) as session:
             try:
                 self.num_requests += 1
-                self.avg_request_len = int((((self.num_requests - 1) * self.avg_request_len) + len(original_request.prompt)) / self.num_requests)
                 self.num_running_requests[prefill_server_id] += 1  
                 exp_t_prefill_prefill = self.estimate_prefill_time(int((1 - pd_balance_factor) * len(original_request.prompt)))
                 self.sum_t_prefill_prefill += exp_t_prefill_prefill   
