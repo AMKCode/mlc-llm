@@ -331,7 +331,6 @@ class Router:  # pylint: disable=too-many-instance-attributes
         pd_ratio = (((est_t_prefill + self.controller.est_t_decode) * self.controller.workload_ratio) - self.controller.est_t_decode) / est_t_prefill
 
         pd_balance_factor = float(np.clip(pd_ratio, 0.0, 1.0))
-
         # Tell D to prepare metadata for prompt[0:kv_window_end].
         # P does not need to sample. Ask D to treat the last
         # token like the first sampled token.
