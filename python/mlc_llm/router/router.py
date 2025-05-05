@@ -21,7 +21,7 @@ import time
 class RouterProfiler:
     """Controller for the PD offload ratio"""
 
-    def __init__(self, router, period=0.25, debug_mode=True):
+    def __init__(self, router, period=0.25, momentum=0.3, debug_mode=True):
         self.router = router
         self.period = period
         self.debug_mode = debug_mode
@@ -30,6 +30,10 @@ class RouterProfiler:
         self.throughput = 0.0
         self.workload_ratio = 0.0
         self.est_t_decode = 0.0
+
+        self.sum_t_decode = 0.0
+
+        self.momentum = momentum
 
         # thread
         self._thread = threading.Thread(target=self._step, daemon=True)
@@ -59,24 +63,27 @@ class RouterProfiler:
                 avg_batch_size = self.router.num_running_requests[decode_server_id] - self.router.num_prefill_decode
                 tpot = self.router.get_TPOT(avg_batch_size)
 
-                sum_t_decode = ((num_prefilling_requests - 1) / self.throughput) + (self.router.avg_num_decode_tokens * tpot)
+                self.sum_t_decode = ((num_prefilling_requests - 1) / self.throughput) + (self.router.avg_num_decode_tokens * tpot)
 
                 # ratio of amount of work in prefill to the amount of work in decode
-                self.workload_ratio = self.router.sum_t_prefill_prefill / \
-                        (self.router.sum_t_prefill_decode + \
-                        sum_t_decode)
+                ratio = self.router.sum_t_prefill_prefill / \
+                        (self.router.sum_t_prefill_prefill + self.router.sum_t_prefill_decode + \
+                        self.sum_t_decode)
+                self.workload_ratio = (self.momentum * ratio) + ((1 - self.momentum) * self.workload_ratio)
             
                 self.est_t_decode = max(tpot, 1.0 / self.throughput)
 
             # print statements
-            if self.debug_mode and ((self.ctr % 10) == 0):
+            if self.debug_mode and ((self.ctr % 2) == 0):
                 print(f"prefill: {self.router.num_running_requests[prefill_server_id]}")
                 print(f"decode: {self.router.num_running_requests[decode_server_id]}")
                 print(f"throughput: {self.throughput}")
+                print(f"sum_t_decode: {self.sum_t_decode}")
                 print(f"num_prefill_decode: {self.router.num_prefill_decode}")
                 print(f"sum_t_prefill_prefill: {self.router.sum_t_prefill_prefill}")
                 print(f"sum_t_prefill_decode: {self.router.sum_t_prefill_decode}")
                 print(f"workload_ratio: {self.workload_ratio}")
+                print(f"est_t_decode: {self.est_t_decode}")
             self.ctr += 1
         
 
@@ -186,10 +193,10 @@ class Router:  # pylint: disable=too-many-instance-attributes
         self.controller = RouterProfiler(self)
 
     def estimate_prefill_time(self, request_len: int):
-        return (request_len * 0.00005605) + 0.000002299
+        return (request_len * 0.0000492670) + 0.017136757
     
     def get_TPOT(self, batch_size):
-        return (batch_size * 0.00014956) + 0.010226
+        return (batch_size * 0.000146145) + 0.009943776
     
     def terminate(self):
         """Terminate the underlying servers"""
@@ -328,9 +335,14 @@ class Router:  # pylint: disable=too-many-instance-attributes
         decode_server_id = self._pick_endpoint(range(1, self.num_servers))
 
         est_t_prefill = self.estimate_prefill_time(len(original_request.prompt))
-        pd_ratio = (((est_t_prefill + self.controller.est_t_decode) * self.controller.workload_ratio) - self.controller.est_t_decode) / est_t_prefill
 
+        pd_ratio = (((est_t_prefill + self.controller.est_t_decode) * self.controller.workload_ratio) - self.controller.est_t_decode) / est_t_prefill
         pd_balance_factor = float(np.clip(pd_ratio, 0.0, 1.0))
+        
+        # DELETE THIS
+        # pd_balance_factor = 0.3
+        
+        print(f"pd_balance_factor: {pd_balance_factor}")
         # Tell D to prepare metadata for prompt[0:kv_window_end].
         # P does not need to sample. Ask D to treat the last
         # token like the first sampled token.
