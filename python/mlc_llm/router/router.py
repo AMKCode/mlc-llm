@@ -331,9 +331,6 @@ class Router:  # pylint: disable=too-many-instance-attributes
         prefill_server_id = 0
         decode_server_id = self._pick_endpoint(range(1, self.num_servers))
 
-        est_t_prefill = self.estimate_prefill_time(len(original_request.prompt))
-
-        # pd_ratio = (((est_t_prefill + self.controller.est_t_decode) * self.controller.workload_ratio) - self.controller.est_t_decode) / est_t_prefill
         pd_balance_factor = float(np.clip(self.controller.workload_ratio, 0.0, 1.0))
         
         # DELETE THIS
