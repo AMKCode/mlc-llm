@@ -21,7 +21,7 @@ import time
 class RouterProfiler:
     """Controller for the PD offload ratio"""
 
-    def __init__(self, router, period=0.25, momentum=0.3, debug_mode=True):
+    def __init__(self, router, period=0.25, debug_mode=True):
         self.router = router
         self.period = period
         self.debug_mode = debug_mode
@@ -32,8 +32,6 @@ class RouterProfiler:
         self.est_t_decode = 0.0
 
         self.sum_t_decode = 0.0
-
-        self.momentum = momentum
 
         # thread
         self._thread = threading.Thread(target=self._step, daemon=True)
@@ -66,10 +64,9 @@ class RouterProfiler:
                 self.sum_t_decode = ((num_prefilling_requests - 1) / self.throughput) + (self.router.avg_num_decode_tokens * tpot)
 
                 # ratio of amount of work in prefill to the amount of work in decode
-                ratio = self.router.sum_t_prefill_prefill / \
-                        (self.router.sum_t_prefill_prefill + self.router.sum_t_prefill_decode + \
-                        self.sum_t_decode)
-                self.workload_ratio = (self.momentum * ratio) + ((1 - self.momentum) * self.workload_ratio)
+                self.workload_ratio = self.router.sum_t_prefill_prefill / \
+                        (self.router.sum_t_prefill_prefill + \
+                         self.router.sum_t_prefill_decode + self.sum_t_decode)
             
                 self.est_t_decode = max(tpot, 1.0 / self.throughput)
 
@@ -336,8 +333,8 @@ class Router:  # pylint: disable=too-many-instance-attributes
 
         est_t_prefill = self.estimate_prefill_time(len(original_request.prompt))
 
-        pd_ratio = (((est_t_prefill + self.controller.est_t_decode) * self.controller.workload_ratio) - self.controller.est_t_decode) / est_t_prefill
-        pd_balance_factor = float(np.clip(pd_ratio, 0.0, 1.0))
+        # pd_ratio = (((est_t_prefill + self.controller.est_t_decode) * self.controller.workload_ratio) - self.controller.est_t_decode) / est_t_prefill
+        pd_balance_factor = float(np.clip(self.controller.workload_ratio, 0.0, 1.0))
         
         # DELETE THIS
         # pd_balance_factor = 0.3
@@ -356,13 +353,6 @@ class Router:  # pylint: disable=too-many-instance-attributes
             timeout=aiohttp.ClientTimeout(total=3 * 3600), trust_env=True
         ) as session:
             try:
-                self.num_requests += 1
-                self.num_running_requests[prefill_server_id] += 1  
-                exp_t_prefill_prefill = self.estimate_prefill_time(int((1 - pd_balance_factor) * len(original_request.prompt)))
-                self.sum_t_prefill_prefill += exp_t_prefill_prefill   
-                exp_t_prefill_decode = self.estimate_prefill_time(int(pd_balance_factor * len(original_request.prompt)))
-                self.sum_t_prefill_decode += exp_t_prefill_decode
-
                 # 1. Ask D to prepare metadata
                 prep_recv_request = microserving_entrypoints.PrepRecvRequest(
                     **original_request.model_dump(), end=kv_window_end
@@ -382,6 +372,13 @@ class Router:  # pylint: disable=too-many-instance-attributes
                     else kv_window_end
                 )
                 assert prefix_matched_length <= kv_window_end
+
+                self.num_requests += 1
+                self.num_running_requests[prefill_server_id] += 1  
+                exp_t_prefill_prefill = self.estimate_prefill_time(int((1 - pd_balance_factor) * len(original_request.prompt)))
+                self.sum_t_prefill_prefill += exp_t_prefill_prefill
+                exp_t_prefill_decode = self.estimate_prefill_time(int(pd_balance_factor * len(original_request.prompt)))
+                self.sum_t_prefill_decode += exp_t_prefill_decode
 
                 # 2. Send P the prefill request and D's metadata. When it returns, it means that
                 # KV transfer has finished prefilling and transferring the KV of
