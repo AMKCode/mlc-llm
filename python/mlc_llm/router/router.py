@@ -64,9 +64,9 @@ class RouterProfiler:
                 self.sum_t_decode = ((num_prefilling_requests - 1) / self.throughput) + (self.router.avg_num_decode_tokens * tpot)
 
                 # ratio of amount of work in prefill to the amount of work in decode
-                self.workload_ratio = self.router.sum_t_prefill_prefill / \
+                self.workload_ratio = float(np.clip(self.router.sum_t_prefill_prefill / \
                         (self.router.sum_t_prefill_prefill + \
-                         self.router.sum_t_prefill_decode + self.sum_t_decode)
+                         self.router.sum_t_prefill_decode + self.sum_t_decode), 0.0, 1.0))
             
                 self.est_t_decode = max(tpot, 1.0 / self.throughput)
 
@@ -232,7 +232,7 @@ class Router:  # pylint: disable=too-many-instance-attributes
         """
         if self.router_mode == "disagg":
             async for response in self._handle_completion_disagg(
-                request, request_id, pd_balance_factor=self.pd_balance_factor
+                request, request_id, pd_balance_factor=self.controller.workload_ratio
             ):
                 yield response
         elif self.router_mode == "round-robin":
@@ -316,7 +316,7 @@ class Router:  # pylint: disable=too-many-instance-attributes
         self,
         original_request: openai_api_protocol.CompletionRequest,
         request_id: str,
-        pd_balance_factor=0,
+        pd_balance_factor: float,
     ) -> AsyncGenerator[openai_api_protocol.CompletionResponse, Any]:
         """
         Handle a completion request from API with disaggregated scheduling. Given two servers
@@ -331,16 +331,13 @@ class Router:  # pylint: disable=too-many-instance-attributes
         prefill_server_id = 0
         decode_server_id = self._pick_endpoint(range(1, self.num_servers))
 
-        pd_balance_factor = float(np.clip(self.controller.workload_ratio, 0.0, 1.0))
-        
         # DELETE THIS
         # pd_balance_factor = 0.3
-        
-        print(f"pd_balance_factor: {pd_balance_factor}")
+
         # Tell D to prepare metadata for prompt[0:kv_window_end].
         # P does not need to sample. Ask D to treat the last
         # token like the first sampled token.
-        # print(f"pd_balance_factor: {pd_balance_factor:.3f}")
+        print(f"pd_balance_factor: {pd_balance_factor:.3f}")
         kv_window_end = (
             -1
             if math.fabs(pd_balance_factor) < 1e-5
