@@ -183,12 +183,12 @@ class LoogleDataset(Dataset):  # pylint: disable=too-few-public-methods
         generate_lens = []
         questions = []
         for data in raw_dataset:
-            prompt = data["input"]
+            prompt = data["context"]
             prompts.append(prompt)
-            qa_pairs = eval(data["qa_pairs"])  # pylint: disable=eval-used
-            questions.append([j["Q"] for j in qa_pairs])
+            question = data["question"]
+            questions.append(question)
             generate_lens.append(
-                [len(tokenizer.encode(j["A"], add_special_tokens=False)) for j in qa_pairs]
+                [len(data["answer"])]
             )
         prompt_token_ids = tokenizer(
             prompts,

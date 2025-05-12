@@ -21,15 +21,17 @@ import time
 class RouterProfiler:
     """Controller for the PD offload ratio"""
 
-    def __init__(self, router, period=0.25, debug_mode=True):
+    def __init__(self, router, period=2.5, momentum=0.3, debug_mode=True):
         self.router = router
         self.period = period
         self.debug_mode = debug_mode
-        self.ctr = 0
+        self.momentum = momentum
 
         self.throughput = 0.0
+
         self.workload_ratio = 0.0
-        self.est_t_decode = 0.0
+        self.idle_offload_ratio = 0.0
+        self.pd_balance_factor = 0.0
 
         self.sum_t_decode = 0.0
 
@@ -44,44 +46,62 @@ class RouterProfiler:
             prefill_server_id = 0
             decode_server_id = 1
 
+            self.router.total_prefill_idle_time += (time.time() - self.router.ts_of_latest_prefill_idle) if self.router.ts_of_latest_prefill_idle is not None else 0.0
+            
+            # I
+            prefill_idle_factor = self.router.total_prefill_idle_time / self.period
+            # rl
+            prefilling_workload = (self.period - (prefill_idle_factor * self.period)) / (1.0 - self.workload_ratio)
+            
+            if prefilling_workload > 0:
+                self.idle_offload_ratio = max(0.0, 1.0 - (self.period / prefilling_workload))
+
             num_prefilling_requests = self.router.num_running_requests[prefill_server_id] + self.router.num_prefill_decode
 
-            if (self.ctr % 10) == 0:
-                prefill_throughput = self.router.num_prefills_done / (self.period * 10)
-                prefill_throughput_decode = self.router.num_prefills_done_decode / (self.period * 10)
-                # we take the min() because the overall throughput/rate is the minimum of two engines connected in series
-                tpt = min(prefill_throughput_decode, prefill_throughput)
-                if tpt > 0:
-                    self.throughput = tpt
-                
-                self.router.num_prefills_done = 0
-                self.router.num_prefills_done_decode = 0
+            prefill_throughput = self.router.num_prefills_done / self.period
+            prefill_throughput_decode = self.router.num_prefills_done_decode / self.period
+            # we take the min() because the overall throughput/rate is the minimum of two engines connected in series
+            tpt = min(prefill_throughput_decode, prefill_throughput)
+            if tpt > 0:
+                self.throughput = tpt
+            
+            avg_batch_size = self.router.num_running_requests[decode_server_id] - self.router.num_prefill_decode
+            tpot = self.router.get_TPOT(avg_batch_size)
             
             if num_prefilling_requests > 0 and self.throughput > 0:
-                avg_batch_size = self.router.num_running_requests[decode_server_id] - self.router.num_prefill_decode
-                tpot = self.router.get_TPOT(avg_batch_size)
-
                 self.sum_t_decode = ((num_prefilling_requests - 1) / self.throughput) + (self.router.avg_num_decode_tokens * tpot)
 
                 # ratio of amount of work in prefill to the amount of work in decode
-                self.workload_ratio = float(np.clip(self.router.sum_t_prefill_prefill / \
+                self.workload_ratio = self.router.sum_t_prefill_prefill / \
                         (self.router.sum_t_prefill_prefill + \
-                         self.router.sum_t_prefill_decode + self.sum_t_decode), 0.0, 1.0))
+                         self.router.sum_t_prefill_decode + self.sum_t_decode)
             
-                self.est_t_decode = max(tpot, 1.0 / self.throughput)
+            self.pd_balance_factor = (self.momentum * min(self.idle_offload_ratio, self.workload_ratio)) + ((1.0 - self.momentum) * self.pd_balance_factor)
+
+            # DELETE THIS
+            # self.pd_balance_factor = 0.0
 
             # print statements
-            if self.debug_mode and ((self.ctr % 2) == 0):
+            if self.debug_mode:
                 print(f"prefill: {self.router.num_running_requests[prefill_server_id]}")
                 print(f"decode: {self.router.num_running_requests[decode_server_id]}")
                 print(f"throughput: {self.throughput}")
+                print(f"avg_batch_size: {avg_batch_size}")
                 print(f"sum_t_decode: {self.sum_t_decode}")
                 print(f"num_prefill_decode: {self.router.num_prefill_decode}")
                 print(f"sum_t_prefill_prefill: {self.router.sum_t_prefill_prefill}")
                 print(f"sum_t_prefill_decode: {self.router.sum_t_prefill_decode}")
                 print(f"workload_ratio: {self.workload_ratio}")
-                print(f"est_t_decode: {self.est_t_decode}")
-            self.ctr += 1
+                print(f"prefill_idle_factor: {prefill_idle_factor}")
+                print(f"idle_offload_ratio: {self.idle_offload_ratio}")
+                print(f"prefilling_workload: {prefilling_workload}")
+                print(f"avg_num_decode_tokens: {self.router.avg_num_decode_tokens}")
+
+            # zero out profiling variables
+            self.router.total_prefill_idle_time = 0.0
+            self.router.ts_of_latest_prefill_idle = time.time() if self.router.num_running_requests[prefill_server_id] == 0 else None
+            self.router.num_prefills_done = 0
+            self.router.num_prefills_done_decode = 0
         
 
 class Router:  # pylint: disable=too-many-instance-attributes
@@ -142,6 +162,10 @@ class Router:  # pylint: disable=too-many-instance-attributes
         self.num_requests = 0
         self.avg_num_decode_tokens = 100
 
+        # idle time measurements
+        self.total_prefill_idle_time = 0.0
+        self.ts_of_latest_prefill_idle = 0.0
+
         # sum of the time for queued prefill in the prefill engine
         self.sum_t_prefill_prefill = 0.0
         # sum of the time for queued prefill in the decode engine
@@ -187,6 +211,7 @@ class Router:  # pylint: disable=too-many-instance-attributes
         self.tokenizer = Tokenizer(model)
 
         # added controller
+        self.ts_of_latest_prefill_idle = time.time()
         self.controller = RouterProfiler(self)
 
     def estimate_prefill_time(self, request_len: int):
@@ -232,7 +257,7 @@ class Router:  # pylint: disable=too-many-instance-attributes
         """
         if self.router_mode == "disagg":
             async for response in self._handle_completion_disagg(
-                request, request_id, pd_balance_factor=self.controller.workload_ratio
+                request, request_id, pd_balance_factor=self.controller.pd_balance_factor
             ):
                 yield response
         elif self.router_mode == "round-robin":
@@ -331,9 +356,6 @@ class Router:  # pylint: disable=too-many-instance-attributes
         prefill_server_id = 0
         decode_server_id = self._pick_endpoint(range(1, self.num_servers))
 
-        # DELETE THIS
-        # pd_balance_factor = 0.3
-
         # Tell D to prepare metadata for prompt[0:kv_window_end].
         # P does not need to sample. Ask D to treat the last
         # token like the first sampled token.
@@ -347,6 +369,11 @@ class Router:  # pylint: disable=too-many-instance-attributes
             timeout=aiohttp.ClientTimeout(total=3 * 3600), trust_env=True
         ) as session:
             try:
+                if self.num_running_requests[prefill_server_id] == 0:
+                        if self.ts_of_latest_prefill_idle is not None:
+                            self.total_prefill_idle_time += time.time() - self.ts_of_latest_prefill_idle
+                            self.ts_of_latest_prefill_idle = None
+            
                 # 1. Ask D to prepare metadata
                 prep_recv_request = microserving_entrypoints.PrepRecvRequest(
                     **original_request.model_dump(), end=kv_window_end
@@ -395,6 +422,9 @@ class Router:  # pylint: disable=too-many-instance-attributes
                 self.sum_t_prefill_prefill -= exp_t_prefill_prefill
                 self.num_prefills_done += 1
                 self.num_prefill_decode += 1
+
+                if self.num_running_requests[prefill_server_id] == 0:
+                    self.ts_of_latest_prefill_idle = time.time()
 
                 # 3. Start decoding, receive and yield back response as a normal request
                 # The kv window passed through denotes the range to prefill on the
