@@ -21,87 +21,99 @@ import time
 class RouterProfiler:
     """Controller for the PD offload ratio"""
 
-    def __init__(self, router, period=2.5, momentum=0.3, debug_mode=True):
+    def __init__(self, router, period=0.5, momentum=0.5, steepness=25.0, debug_mode=True):
         self.router = router
         self.period = period
         self.debug_mode = debug_mode
         self.momentum = momentum
+        self.steepness = steepness
 
         self.throughput = 0.0
+        self.prefill_idle_factor = 0.0
+        self.sum_t_decode = 0.0
 
         self.workload_ratio = 0.0
-        self.idle_offload_ratio = 0.0
         self.pd_balance_factor = 0.0
 
-        self.sum_t_decode = 0.0
+        self.cum_sum_pp = 0.0
+        self.cum_sum_pd = 0.0
+        self.ctr = 0
 
         # thread
         self._thread = threading.Thread(target=self._step, daemon=True)
         self._thread.start()
     
+    def sharp_exp(self, x):
+        # return math.exp(-self.steepness * x)
+        return 1.0
+    
     def _step(self):
         while True:
             time.sleep(self.period)
-
-            prefill_server_id = 0
-            decode_server_id = 1
-
-            self.router.total_prefill_idle_time += (time.time() - self.router.ts_of_latest_prefill_idle) if self.router.ts_of_latest_prefill_idle is not None else 0.0
             
-            # I
-            prefill_idle_factor = self.router.total_prefill_idle_time / self.period
-            # rl
-            prefilling_workload = (self.period - (prefill_idle_factor * self.period)) / (1.0 - self.workload_ratio)
+            self.cum_sum_pp += self.router.sum_t_prefill_prefill
+            self.cum_sum_pd += self.router.sum_t_prefill_decode
+
+            if self.ctr % 10 == 0:
+                prefill_server_id = 0
+                decode_server_id = 1
+
+                self.router.total_prefill_idle_time += (time.time() - self.router.ts_of_latest_prefill_idle) if self.router.ts_of_latest_prefill_idle is not None else 0.0
+                
+                self.prefill_idle_factor = self.router.total_prefill_idle_time / (self.period * 10)
+
+                num_prefilling_requests = self.router.num_running_requests[prefill_server_id] + self.router.num_prefill_decode
+
+                prefill_throughput = self.router.num_prefills_done / (self.period * 10)
+                prefill_throughput_decode = self.router.num_prefills_done_decode / (self.period * 10)
+                # we take the min() because the overall throughput/rate is the minimum of two engines connected in series
+                tpt = min(prefill_throughput_decode, prefill_throughput)
+                if tpt > 0:
+                    self.throughput = tpt
+                
+                avg_batch_size = self.router.num_running_requests[decode_server_id] - self.router.num_prefill_decode
+                tpot = self.router.get_TPOT(avg_batch_size)
+                
+                if num_prefilling_requests > 0 and self.throughput > 0:
+                    self.sum_t_decode = ((num_prefilling_requests - 1) / self.throughput) + (self.router.avg_num_decode_tokens * tpot)
+
+                    # ratio of amount of work in prefill to the amount of work in decode
+                    # self.workload_ratio = self.router.sum_t_prefill_prefill / \
+                    #         (self.router.sum_t_prefill_prefill + \
+                    #         self.router.sum_t_prefill_decode + self.sum_t_decode)
+                    self.workload_ratio = self.cum_sum_pp / (self.cum_sum_pp + self.cum_sum_pd + (self.sum_t_decode * 10))
+                
+                self.pd_balance_factor = (self.momentum * (self.sharp_exp(self.prefill_idle_factor) * self.workload_ratio)) + ((1.0 - self.momentum) * self.pd_balance_factor)
+
+                # DELETE THIS
+                # self.pd_balance_factor = 0.45
+
+                # print statements
+                if self.debug_mode:
+                    print(f"prefill: {self.router.num_running_requests[prefill_server_id]}")
+                    print(f"decode: {self.router.num_running_requests[decode_server_id]}")
+                    print(f"throughput: {self.throughput}")
+                    print(f"avg_batch_size: {avg_batch_size}")
+                    print(f"sum_t_decode: {self.sum_t_decode}")
+                    print(f"sum_t_prefill_prefill: {self.cum_sum_pp}")
+                    print(f"sum_t_prefill_decode: {self.cum_sum_pd}")
+                    print(f"workload_ratio: {self.workload_ratio}")
+                    print(f"prefill_idle_factor: {self.prefill_idle_factor}")
+                    print(f"avg_num_decode_tokens: {self.router.avg_num_decode_tokens}")
+                    print(f"router_pd_balance_factor: {self.pd_balance_factor}")
+                    print(f"num_requests_in_period: {self.router.num_requests_in_period}")
+
+                # zero out profiling variables
+                self.router.total_prefill_idle_time = 0.0
+                self.router.ts_of_latest_prefill_idle = time.time() if self.router.num_running_requests[prefill_server_id] == 0 else None
+                self.router.num_prefills_done = 0
+                self.router.num_prefills_done_decode = 0
+                self.router.num_requests_in_period = 0
+                
+                self.cum_sum_pd = 0.0
+                self.cum_sum_pp = 0.0
             
-            if prefilling_workload > 0:
-                self.idle_offload_ratio = max(0.0, 1.0 - (self.period / prefilling_workload))
-
-            num_prefilling_requests = self.router.num_running_requests[prefill_server_id] + self.router.num_prefill_decode
-
-            prefill_throughput = self.router.num_prefills_done / self.period
-            prefill_throughput_decode = self.router.num_prefills_done_decode / self.period
-            # we take the min() because the overall throughput/rate is the minimum of two engines connected in series
-            tpt = min(prefill_throughput_decode, prefill_throughput)
-            if tpt > 0:
-                self.throughput = tpt
-            
-            avg_batch_size = self.router.num_running_requests[decode_server_id] - self.router.num_prefill_decode
-            tpot = self.router.get_TPOT(avg_batch_size)
-            
-            if num_prefilling_requests > 0 and self.throughput > 0:
-                self.sum_t_decode = ((num_prefilling_requests - 1) / self.throughput) + (self.router.avg_num_decode_tokens * tpot)
-
-                # ratio of amount of work in prefill to the amount of work in decode
-                self.workload_ratio = self.router.sum_t_prefill_prefill / \
-                        (self.router.sum_t_prefill_prefill + \
-                         self.router.sum_t_prefill_decode + self.sum_t_decode)
-            
-            self.pd_balance_factor = (self.momentum * min(self.idle_offload_ratio, self.workload_ratio)) + ((1.0 - self.momentum) * self.pd_balance_factor)
-
-            # DELETE THIS
-            # self.pd_balance_factor = 0.0
-
-            # print statements
-            if self.debug_mode:
-                print(f"prefill: {self.router.num_running_requests[prefill_server_id]}")
-                print(f"decode: {self.router.num_running_requests[decode_server_id]}")
-                print(f"throughput: {self.throughput}")
-                print(f"avg_batch_size: {avg_batch_size}")
-                print(f"sum_t_decode: {self.sum_t_decode}")
-                print(f"num_prefill_decode: {self.router.num_prefill_decode}")
-                print(f"sum_t_prefill_prefill: {self.router.sum_t_prefill_prefill}")
-                print(f"sum_t_prefill_decode: {self.router.sum_t_prefill_decode}")
-                print(f"workload_ratio: {self.workload_ratio}")
-                print(f"prefill_idle_factor: {prefill_idle_factor}")
-                print(f"idle_offload_ratio: {self.idle_offload_ratio}")
-                print(f"prefilling_workload: {prefilling_workload}")
-                print(f"avg_num_decode_tokens: {self.router.avg_num_decode_tokens}")
-
-            # zero out profiling variables
-            self.router.total_prefill_idle_time = 0.0
-            self.router.ts_of_latest_prefill_idle = time.time() if self.router.num_running_requests[prefill_server_id] == 0 else None
-            self.router.num_prefills_done = 0
-            self.router.num_prefills_done_decode = 0
+            self.ctr += 1
         
 
 class Router:  # pylint: disable=too-many-instance-attributes
@@ -172,6 +184,9 @@ class Router:  # pylint: disable=too-many-instance-attributes
         self.sum_t_prefill_decode = 0.0
         # number of requests in the decode engine which are prefilling
         self.num_prefill_decode = 0
+
+        # number of requests in this period
+        self.num_requests_in_period = 0
 
         def start_server(i: int):
             nvshmem_config = {
@@ -395,6 +410,7 @@ class Router:  # pylint: disable=too-many-instance-attributes
                 assert prefix_matched_length <= kv_window_end
 
                 self.num_requests += 1
+                self.num_requests_in_period += 1
                 self.num_running_requests[prefill_server_id] += 1  
                 exp_t_prefill_prefill = self.estimate_prefill_time(int((1 - pd_balance_factor) * len(original_request.prompt)))
                 self.sum_t_prefill_prefill += exp_t_prefill_prefill
