@@ -21,12 +21,11 @@ import time
 class RouterProfiler:
     """Controller for the PD offload ratio"""
 
-    def __init__(self, router, period=0.5, momentum=0.5, steepness=25.0, debug_mode=True):
+    def __init__(self, router, period=0.5, momentum=0.5, debug_mode=True):
         self.router = router
         self.period = period
         self.debug_mode = debug_mode
         self.momentum = momentum
-        self.steepness = steepness
 
         self.throughput = 0.0
         self.prefill_idle_factor = 0.0
@@ -42,10 +41,6 @@ class RouterProfiler:
         # thread
         self._thread = threading.Thread(target=self._step, daemon=True)
         self._thread.start()
-    
-    def sharp_exp(self, x):
-        # return math.exp(-self.steepness * x)
-        return 1.0
     
     def _step(self):
         while True:
@@ -66,6 +61,7 @@ class RouterProfiler:
 
                 prefill_throughput = self.router.num_prefills_done / (self.period * 10)
                 prefill_throughput_decode = self.router.num_prefills_done_decode / (self.period * 10)
+                
                 # we take the min() because the overall throughput/rate is the minimum of two engines connected in series
                 tpt = min(prefill_throughput_decode, prefill_throughput)
                 if tpt > 0:
@@ -76,14 +72,9 @@ class RouterProfiler:
                 
                 if num_prefilling_requests > 0 and self.throughput > 0:
                     self.sum_t_decode = ((num_prefilling_requests - 1) / self.throughput) + (self.router.avg_num_decode_tokens * tpot)
-
-                    # ratio of amount of work in prefill to the amount of work in decode
-                    # self.workload_ratio = self.router.sum_t_prefill_prefill / \
-                    #         (self.router.sum_t_prefill_prefill + \
-                    #         self.router.sum_t_prefill_decode + self.sum_t_decode)
                     self.workload_ratio = self.cum_sum_pp / (self.cum_sum_pp + self.cum_sum_pd + (self.sum_t_decode * 10))
                 
-                self.pd_balance_factor = (self.momentum * (self.sharp_exp(self.prefill_idle_factor) * self.workload_ratio)) + ((1.0 - self.momentum) * self.pd_balance_factor)
+                self.pd_balance_factor = (self.momentum * self.workload_ratio) + ((1.0 - self.momentum) * self.pd_balance_factor)
 
                 # DELETE THIS
                 # self.pd_balance_factor = 0.45
