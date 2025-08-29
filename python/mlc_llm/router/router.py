@@ -18,7 +18,7 @@ from mlc_llm.tokenizers import Tokenizer
 
 import time
 
-class RouterProfiler:
+class RouterController:
     """Controller for the PD offload ratio"""
 
     def __init__(self, router, period=0.5, momentum=0.5, debug_mode=True):
@@ -32,7 +32,7 @@ class RouterProfiler:
         self.sum_t_decode = 0.0
 
         self.workload_ratio = 0.0
-        self.pd_balance_factor = 0.0
+        self.pd_balance_factor = 0.3
 
         self.cum_sum_pp = 0.0
         self.cum_sum_pd = 0.0
@@ -218,7 +218,7 @@ class Router:  # pylint: disable=too-many-instance-attributes
 
         # added controller
         self.ts_of_latest_prefill_idle = time.time()
-        self.controller = RouterProfiler(self)
+        self.controller = RouterController(self)
 
     def estimate_prefill_time(self, request_len: int):
         return (request_len * 0.0000492670) + 0.017136757
@@ -471,7 +471,6 @@ class Router:  # pylint: disable=too-many-instance-attributes
             except Exception as e:
                 self.num_running_requests[decode_server_id] -= 1
                 raise e
-            
             self.num_running_requests[decode_server_id] -= 1
 
     async def send_prepare_receive(
