@@ -33,6 +33,7 @@ class RouterController:
 
         self.workload_ratio = 0.0
         self.pd_balance_factor = 0.3
+        self.raw_pd_balance_factor = 0.0
 
         self.cum_sum_pp = 0.0
         self.cum_sum_pd = 0.0
@@ -74,10 +75,20 @@ class RouterController:
                     self.sum_t_decode = ((num_prefilling_requests - 1) / self.throughput) + (self.router.avg_num_decode_tokens * tpot)
                     self.workload_ratio = self.cum_sum_pp / (self.cum_sum_pp + self.cum_sum_pd + (self.sum_t_decode * 10))
                 
-                self.pd_balance_factor = (self.momentum * self.workload_ratio) + ((1.0 - self.momentum) * self.pd_balance_factor)
+                # self.pd_balance_factor = (self.momentum * self.workload_ratio) + ((1.0 - self.momentum) * self.pd_balance_factor)
+
+                # maximizing throughput based on number of prefilling tokens per period
+                beta_0 = 0.0000492670
+                beta_1 = 0.017136757
+                total_prefill_time = (self.router.num_prefill_tokens_in_period * beta_0) + beta_1
+                if total_prefill_time < (self.period * 10):
+                    self.pd_balance_factor = 0
+                else:
+                    self.raw_pd_balance_factor = (total_prefill_time - (self.period * 10)) / (self.router.num_prefill_tokens_in_period * beta_0)
+                    self.pd_balance_factor = min(0.5, self.raw_pd_balance_factor)
 
                 # DELETE THIS
-                # self.pd_balance_factor = 0.45
+                # self.pd_balance_factor = 0.0
 
                 # print statements
                 if self.debug_mode:
@@ -92,14 +103,16 @@ class RouterController:
                     print(f"prefill_idle_factor: {self.prefill_idle_factor}")
                     print(f"avg_num_decode_tokens: {self.router.avg_num_decode_tokens}")
                     print(f"router_pd_balance_factor: {self.pd_balance_factor}")
-                    print(f"num_requests_in_period: {self.router.num_requests_in_period}")
+                    print(f"router_raw_pd_balance_factor: {self.raw_pd_balance_factor}")
+                    print(f"num_prefill_tokens_in_period: {self.router.num_prefill_tokens_in_period}")
+                    print(f"total_prefill_time: {total_prefill_time}")
 
                 # zero out profiling variables
                 self.router.total_prefill_idle_time = 0.0
                 self.router.ts_of_latest_prefill_idle = time.time() if self.router.num_running_requests[prefill_server_id] == 0 else None
                 self.router.num_prefills_done = 0
                 self.router.num_prefills_done_decode = 0
-                self.router.num_requests_in_period = 0
+                self.router.num_prefill_tokens_in_period = 0
                 
                 self.cum_sum_pd = 0.0
                 self.cum_sum_pp = 0.0
@@ -176,8 +189,8 @@ class Router:  # pylint: disable=too-many-instance-attributes
         # number of requests in the decode engine which are prefilling
         self.num_prefill_decode = 0
 
-        # number of requests in this period
-        self.num_requests_in_period = 0
+        # number of prefill tokens in this period
+        self.num_prefill_tokens_in_period = 0
 
         def start_server(i: int):
             nvshmem_config = {
@@ -361,6 +374,9 @@ class Router:  # pylint: disable=too-many-instance-attributes
         # Arbitrarily determine server 0 is P, other servers are D
         prefill_server_id = 0
         decode_server_id = self._pick_endpoint(range(1, self.num_servers))
+        
+        # update number of prefil tokens in period
+        self.num_prefill_tokens_in_period += len(original_request.prompt)
 
         # Tell D to prepare metadata for prompt[0:kv_window_end].
         # P does not need to sample. Ask D to treat the last
@@ -401,8 +417,7 @@ class Router:  # pylint: disable=too-many-instance-attributes
                 assert prefix_matched_length <= kv_window_end
 
                 self.num_requests += 1
-                self.num_requests_in_period += 1
-                self.num_running_requests[prefill_server_id] += 1  
+                self.num_running_requests[prefill_server_id] += 1
                 exp_t_prefill_prefill = self.estimate_prefill_time(int((1 - pd_balance_factor) * len(original_request.prompt)))
                 self.sum_t_prefill_prefill += exp_t_prefill_prefill
                 exp_t_prefill_decode = self.estimate_prefill_time(int(pd_balance_factor * len(original_request.prompt)))
