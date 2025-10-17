@@ -44,7 +44,7 @@ class RouterController:
             # maximizing throughput based on number of prefilling tokens per period
             beta_0 = 0.0000556613
             beta_1 = 0.0205248
-            total_prefill_time = (self.router.num_prefill_tokens_in_period * beta_0) + beta_1
+            total_prefill_time = (self.router.num_prefill_tokens_in_period * beta_0) + (self.router.num_requests_in_period * beta_1)
             if total_prefill_time < self.period:
                 initial_pd_balance_factor = 0
             else:
@@ -58,9 +58,11 @@ class RouterController:
             # number of requests decoding at decode
             num_decode_decode = self.router.num_running_requests[decode_server_id] - self.router.num_prefill_decode
 
-            decode_congestion = 1.0 - min(1.0, num_decode_decode / max_decode_batch_size)
+            congestion_threshold = 0.8
+            decode_congestion = min(1.0, num_decode_decode / max_decode_batch_size)
+            max_pd_threshold = 0.4 if decode_congestion < congestion_threshold else (0.4 / (congestion_threshold - 1)) * (decode_congestion - 1)
 
-            self.pd_balance_factor = round(min(decode_congestion, self.raw_pd_balance_factor), 2)
+            self.pd_balance_factor = round(min(max_pd_threshold, self.raw_pd_balance_factor), 2)
 
             # USE THIS TO FIX PD RATIO
             # self.pd_balance_factor = 0.0
@@ -73,7 +75,7 @@ class RouterController:
                 print(f"num_prefill_tokens_in_period: {self.router.num_prefill_tokens_in_period}")
                 print(f"total_prefill_time: {total_prefill_time}")
                 print(f"total_prefill_idle_time: {self.router.total_prefill_idle_time}")
-                print(f"decode_congestion: {decode_congestion}")
+                print(f"decode_congestion: {max_pd_threshold}")
                 print(f"num_decode_decode: {num_decode_decode}")
 
 
